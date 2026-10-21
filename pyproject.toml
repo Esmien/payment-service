@@ -30,6 +30,8 @@ pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
+
+
 [tool.ruff]
 target-version = "py312"
 exclude = [
@@ -65,5 +67,4 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [tool.ruff.lint.isort]
-# DEVIATION: в CONVENTIONS.md перечислены модули другого проекта (fsm, handlers, keyboards); заменены на пакеты этого сервиса.
 known-first-party = ["core", "api", "services", "worker", "models", "schemas"]
