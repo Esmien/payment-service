@@ -1,6 +1,7 @@
 """Настройки приложения, загружаемые из переменных окружения и файла .env."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Final
 
 from pydantic import AmqpDsn, Field, PostgresDsn, SecretStr
@@ -31,7 +32,11 @@ class Settings(BaseSettings):
 
     # Имена переменных окружения регистронезависимы: DATABASE_URL заполняет поле database_url.
     # extra="ignore" нужен, потому что в одном .env могут лежать переменные для других сервисов.
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parent.parent.parent / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     database_url: PostgresDsn = Field(default=PostgresDsn(DEFAULT_DATABASE_URL))
     rabbitmq_url: AmqpDsn = Field(default=AmqpDsn(DEFAULT_RABBITMQ_URL))
