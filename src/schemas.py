@@ -2,12 +2,16 @@
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Final
 from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from core.constants import Currency, PaymentStatus
+
+# Ограничения синхронизированы с колонками models.Payment: String(500) и String(2048).
+PAYMENT_DESCRIPTION_MAX_LENGTH: Final[int] = 500
+WEBHOOK_URL_MAX_LENGTH: Final[int] = 2048
 
 
 class CreatePaymentRequest(BaseModel):
@@ -24,10 +28,29 @@ class CreatePaymentRequest(BaseModel):
     # max_digits=12 и decimal_places=2 совпадают с Numeric(12, 2) в модели Payment.
     amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     currency: Currency
-    description: str
+    description: str = Field(max_length=PAYMENT_DESCRIPTION_MAX_LENGTH)
     # default_factory вместо литерала {}, чтобы каждый экземпляр получал собственный словарь.
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    # JsonValue не пропускает значения, которые нельзя сериализовать в JSONB.
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
     webhook_url: AnyHttpUrl
+
+    @field_validator("webhook_url")
+    @classmethod
+    def _validate_webhook_url_length(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        """Проверяет, что URL помещается в колонку `payments.webhook_url`.
+
+        Args:
+            value: Нормализованный Pydantic URL.
+
+        Returns:
+            Исходный URL без изменений.
+
+        Raises:
+            ValueError: Если сериализованный URL длиннее 2048 символов.
+        """
+        if len(str(value)) > WEBHOOK_URL_MAX_LENGTH:
+            raise ValueError(f"webhook_url must not exceed {WEBHOOK_URL_MAX_LENGTH} characters")
+        return value
 
 
 class PaymentCreatedResponse(BaseModel):
@@ -39,15 +62,15 @@ class PaymentCreatedResponse(BaseModel):
         created_at: Дата и время создания платежа.
     """
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
 
-    payment_id: UUID = Field(validation_alias="id")
+    payment_id: UUID
     status: PaymentStatus
     created_at: datetime
 
 
-class PaymentDetailResponse(BaseModel):
-    """Детальная информация о платеже (200 OK).
+class PaymentDetail(BaseModel):
+    """Детальная информация о платеже.
 
     Attributes:
         payment_id: Идентификатор платежа.
@@ -69,7 +92,7 @@ class PaymentDetailResponse(BaseModel):
     currency: Currency
     description: str
     # В модели Payment атрибут называется metadata_, т.к. metadata зарезервировано в DeclarativeBase.
-    metadata: dict[str, Any] = Field(validation_alias="metadata_")
+    metadata: dict[str, JsonValue] = Field(validation_alias="metadata_")
     status: PaymentStatus
     idempotency_key: str
     webhook_url: str
@@ -103,5 +126,5 @@ class WebhookPayload(BaseModel):
     status: PaymentStatus
     amount: Decimal
     currency: Currency
-    metadata: dict[str, Any]
+    metadata: dict[str, JsonValue]
     processed_at: datetime

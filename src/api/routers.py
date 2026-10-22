@@ -1,0 +1,74 @@
+"""REST-эндпоинты создания и получения платежей (префикс /api/v1/payments)."""
+
+from typing import Annotated, Final
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Header, status
+
+from api.deps import PaymentServiceDepends
+from core.security import verify_api_key
+from schemas import CreatePaymentRequest, PaymentCreatedResponse, PaymentDetail
+
+IDEMPOTENCY_KEY_HEADER_NAME: Final[str] = "Idempotency-Key"
+
+# Заголовок объявлен без значения по умолчанию, поэтому он обязателен:
+# при его отсутствии FastAPI сам вернет 422 Unprocessable Entity.
+IdempotencyKeyHeader = Annotated[str, Header(alias=IDEMPOTENCY_KEY_HEADER_NAME, description="Ключ идемпотентности")]
+
+router = APIRouter(
+    prefix="/payments",
+    tags=["Payment"],
+    # Проверка X-API-Key применяется ко всем эндпоинтам роутера.
+    dependencies=[Depends(dependency=verify_api_key)],
+)
+
+
+@router.post(
+    path="",
+    response_model=PaymentCreatedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Создание платежа",
+)
+async def create_payment(
+    *,
+    service: PaymentServiceDepends,
+    body: CreatePaymentRequest,
+    idempotency_key: IdempotencyKeyHeader,
+) -> PaymentCreatedResponse:
+    """Создает платеж либо возвращает ранее созданный при повторном запросе с тем же ключом.
+
+    Args:
+        service: Сервис платежей из DI-контейнера FastAPI.
+        body: Валидированное тело запроса на создание платежа.
+        idempotency_key: Значение обязательного заголовка `Idempotency-Key`.
+
+    Returns:
+        Краткая информация о платеже для ответа 202 Accepted.
+
+    Raises:
+        IdempotencyConflictError: Если ключ уже использован с другими параметрами тела.
+    """
+    payment_detail = await service.create_payment(idempotency_key=idempotency_key, request=body)
+    return PaymentCreatedResponse.model_validate(obj=payment_detail)
+
+
+@router.get(
+    path="/{payment_id}",
+    response_model=PaymentDetail,
+    status_code=status.HTTP_200_OK,
+    summary="Информация о платеже",
+)
+async def get_payment(*, payment_id: UUID, service: PaymentServiceDepends) -> PaymentDetail:
+    """Возвращает детальную информацию о платеже по его идентификатору.
+
+    Args:
+        payment_id: Идентификатор платежа из пути запроса.
+        service: Сервис платежей из DI-контейнера FastAPI.
+
+    Returns:
+        Детальная информация о платеже.
+
+    Raises:
+        PaymentNotFoundError: Если платеж с указанным идентификатором не найден.
+    """
+    return await service.get_payment_by_id(payment_id=payment_id)

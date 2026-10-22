@@ -12,7 +12,7 @@ from core.constants import Currency, PaymentStatus
 from schemas import (
     CreatePaymentRequest,
     PaymentCreatedResponse,
-    PaymentDetailResponse,
+    PaymentDetail,
     PaymentEventPayload,
     WebhookPayload,
 )
@@ -128,12 +128,13 @@ class TestCreatePaymentRequest:
 class TestPaymentCreatedResponse:
     """Тесты схемы PaymentCreatedResponse."""
 
-    def test_maps_orm_attributes_to_response(self) -> None:
-        """Поля ORM-объекта корректно переносятся в ответ, id попадает в payment_id."""
+    def test_maps_payment_detail_attributes_to_response(self) -> None:
+        """Поля PaymentDetail корректно переносятся в ответ на создание платежа."""
         payment_id = uuid4()
-        orm_payment = SimpleNamespace(id=payment_id, status="pending", created_at=CREATED_AT)
+        # Роутер собирает ответ из PaymentDetail, где поле уже называется payment_id.
+        payment_detail = SimpleNamespace(payment_id=payment_id, status="pending", created_at=CREATED_AT)
 
-        response = PaymentCreatedResponse.model_validate(orm_payment)
+        response = PaymentCreatedResponse.model_validate(payment_detail)
 
         assert response.payment_id == payment_id
         assert response.status is PaymentStatus.PENDING
@@ -141,10 +142,10 @@ class TestPaymentCreatedResponse:
 
     def test_unknown_status_is_rejected(self) -> None:
         """Статус вне перечисления PaymentStatus отклоняется."""
-        orm_payment = SimpleNamespace(id=uuid4(), status="unknown", created_at=CREATED_AT)
+        payment_detail = SimpleNamespace(payment_id=uuid4(), status="unknown", created_at=CREATED_AT)
 
         with pytest.raises(ValidationError):
-            PaymentCreatedResponse.model_validate(orm_payment)
+            PaymentCreatedResponse.model_validate(payment_detail)
 
 
 class TestPaymentDetailResponse:
@@ -176,7 +177,7 @@ class TestPaymentDetailResponse:
         """Все поля ORM-объекта переносятся в ответ, metadata_ читается в metadata."""
         orm_payment = self._build_orm_payment(processed_at=None)
 
-        response = PaymentDetailResponse.model_validate(orm_payment)
+        response = PaymentDetail.model_validate(orm_payment)
 
         assert response.payment_id == orm_payment.id
         assert response.amount == Decimal("250.00")
@@ -190,7 +191,7 @@ class TestPaymentDetailResponse:
         processed_at = datetime(2026, 10, 21, 12, 0, 5, tzinfo=UTC)
         orm_payment = self._build_orm_payment(processed_at=processed_at)
 
-        response = PaymentDetailResponse.model_validate(orm_payment)
+        response = PaymentDetail.model_validate(orm_payment)
 
         assert response.processed_at == processed_at
 
