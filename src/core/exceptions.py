@@ -6,6 +6,7 @@
 
 from http import HTTPStatus
 from typing import Any, ClassVar, Final
+from uuid import UUID
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -53,17 +54,32 @@ class AppError(Exception):
 
 
 class PaymentNotFoundError(AppError):
-    """Платеж с указанным идентификатором не найден (HTTP 404)."""
+    """Платеж с указанным идентификатором не найден (HTTP 404).
+
+    Attributes:
+        payment_id: Идентификатор запрошенного платежа (проставляется базовым __init__).
+    """
 
     http_status_code: ClassVar[int] = HTTPStatus.NOT_FOUND
     client_message: ClassVar[str] = PAYMENT_NOT_FOUND_MESSAGE
 
+    # Аннотация без значения: атрибут создается в AppError.__init__ через setattr(**context).
+    # Без объявления mypy не видит поле у экземпляра и ругается в тестах.
+    payment_id: UUID
+
 
 class IdempotencyConflictError(AppError):
-    """Повторный запрос с тем же Idempotency-Key, но другими параметрами тела (HTTP 409)."""
+    """Повторный запрос с тем же Idempotency-Key, но другими параметрами тела (HTTP 409).
+
+    Attributes:
+        idempotency_key: Ключ идемпотентности конфликтующего запроса (проставляется базовым __init__).
+    """
 
     http_status_code: ClassVar[int] = HTTPStatus.CONFLICT
     client_message: ClassVar[str] = IDEMPOTENCY_CONFLICT_MESSAGE
+
+    # Аналогично PaymentNotFoundError: поле приходит через setattr(**context) в AppError.__init__.
+    idempotency_key: str
 
 
 class UnauthorizedError(AppError):

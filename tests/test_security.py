@@ -1,7 +1,9 @@
 """Тесты проверки заголовка X-API-Key (core.security)."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
+from typing import cast
 
 import httpx
 import pytest
@@ -69,7 +71,9 @@ async def test_verify_api_key_checks_header_value(
         expected_status: Ожидаемый HTTP-статус ответа.
     """
     async with httpx.AsyncClient(transport=ASGITransport(app=_build_app()), base_url="http://test") as client:
-        response = await client.get(PROTECTED_PATH, headers=headers)
+        # httpx принимает байтовые значения заголовков в рантайме, но в типах объявлен только str;
+        # bytes нужны, чтобы передать не-ASCII ключ без падения кодировщика клиента.
+        response = await client.get(PROTECTED_PATH, headers=cast("Mapping[str, str]", headers))
 
     assert response.status_code == expected_status
 

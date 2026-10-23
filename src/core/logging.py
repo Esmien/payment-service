@@ -2,6 +2,7 @@
 
 import logging
 import sys
+from types import FrameType
 from typing import Final
 
 from loguru import logger
@@ -40,7 +41,10 @@ class InterceptHandler(logging.Handler):
 
         # Ищем в стеке первый кадр, не принадлежащий модулю logging,
         # чтобы в записи Loguru оказался реальный модуль-источник, а не сам InterceptHandler.
-        frame, depth = logging.currentframe(), 0
+        # currentframe() и f_back типизированы как FrameType | None, поэтому переменная
+        # аннотируется явно: без этого mypy падает на присваивании результата f_back.
+        frame: FrameType | None = logging.currentframe()
+        depth = 0
         while frame and (depth == 0 or frame.f_code.co_filename == logging.__file__):
             frame = frame.f_back
             depth += 1
