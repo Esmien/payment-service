@@ -1,5 +1,6 @@
 """Репозитории для работы с платежами и outbox-событиями."""
 
+from datetime import datetime
 from typing import Final
 from uuid import UUID
 
@@ -117,3 +118,25 @@ class PaymentRepository:
         await self._session.flush()
 
         return payment
+
+    async def update_processing_result(
+        self,
+        *,
+        payment: Payment,
+        status: PaymentStatus,
+        processed_at: datetime,
+    ) -> None:
+        """Записывает результат обработки платежа в текущую транзакцию.
+
+        Args:
+            payment: Загруженная ORM-модель платежа.
+            status: Итоговый статус обработки.
+            processed_at: Время завершения обработки.
+
+        Returns:
+            None
+        """
+        payment.status = status.value
+        payment.processed_at = processed_at
+        # flush отправляет UPDATE в БД; commit остается за Unit of Work.
+        await self._session.flush()
