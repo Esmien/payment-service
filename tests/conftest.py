@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from api.app import app
 from api.deps import get_uow
 from core.config import Settings, get_settings
-from core.constants import EVENT_TYPE_PAYMENT_CREATED, OutboxStatus, PaymentStatus
+from core.constants import EVENT_TYPE_PAYMENT_CREATED, OutboxStatus, PaymentStatus, WebhookStatus
 from core.engine import Base
 from models import OutboxEvent, Payment
 from schemas import CreatePaymentRequest, PaymentEventPayload
@@ -103,6 +103,9 @@ class InMemoryPaymentRepository:
             webhook_url=str(request.webhook_url),
             created_at=datetime.now(tz=UTC),
             processed_at=None,
+            webhook_status=WebhookStatus.PENDING.value,
+            webhook_attempts=0,
+            webhook_last_error=None,
         )
         self.payments[idempotency_key] = payment
         self.outbox_events.append(
@@ -209,13 +212,19 @@ def make_payment() -> PaymentFactory:
             webhook_url=str(request.webhook_url),
             created_at=datetime.now(tz=UTC),
             processed_at=None,
+            webhook_status=WebhookStatus.PENDING.value,
+            webhook_attempts=0,
+            webhook_last_error=None,
         )
 
     return _factory
 
 
 @pytest.fixture
-async def api_client(uow: InMemoryUnitOfWork, test_settings: Settings) -> AsyncIterator[AsyncClient]:
+async def api_client(
+    uow: InMemoryUnitOfWork,
+    test_settings: Settings,
+) -> AsyncIterator[AsyncClient]:
     """Выдает HTTP-клиент поверх ASGI-приложения с подмененными зависимостями.
 
     Args:

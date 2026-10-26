@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.constants import Currency, OutboxStatus, PaymentStatus
+from core.constants import Currency, OutboxStatus, PaymentStatus, WebhookStatus
 from models import OutboxEvent, Payment
 from services.outbox import cleanup_processed_events
 
@@ -49,6 +49,9 @@ async def test_payment_is_persisted_with_defaults(session: AsyncSession) -> None
     assert stored.amount == Decimal("100.00")
     assert stored.created_at is not None
     assert stored.processed_at is None
+    assert stored.webhook_status == WebhookStatus.PENDING
+    assert stored.webhook_attempts == 0
+    assert stored.webhook_last_error is None
 
 
 async def test_outbox_event_is_persisted_with_pending_status(session: AsyncSession) -> None:

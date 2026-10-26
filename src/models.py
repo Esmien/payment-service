@@ -5,11 +5,17 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, Index, Numeric, String, func
+from sqlalchemy import CheckConstraint, DateTime, Index, Integer, Numeric, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from core.constants import IDEMPOTENCY_KEY_MAX_LENGTH, OutboxStatus, PaymentStatus
+from core.constants import (
+    IDEMPOTENCY_KEY_MAX_LENGTH,
+    WEBHOOK_LAST_ERROR_MAX_LENGTH,
+    OutboxStatus,
+    PaymentStatus,
+    WebhookStatus,
+)
 from core.engine import Base
 
 
@@ -27,6 +33,9 @@ class Payment(Base):
         webhook_url: URL для уведомления о результате.
         created_at: Дата и время создания.
         processed_at: Дата и время завершения обработки шлюзом.
+        webhook_status: Статус доставки webhook-уведомления.
+        webhook_attempts: Суммарное количество HTTP-попыток доставки webhook.
+        webhook_last_error: Техническое описание последней ошибки доставки.
     """
 
     __tablename__ = "payments"
@@ -48,6 +57,17 @@ class Payment(Base):
     webhook_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    webhook_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=WebhookStatus.PENDING.value,
+        server_default=WebhookStatus.PENDING.value,
+    )
+    webhook_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    webhook_last_error: Mapped[str | None] = mapped_column(
+        String(WEBHOOK_LAST_ERROR_MAX_LENGTH),
+        nullable=True,
+    )
 
 
 class OutboxEvent(Base):

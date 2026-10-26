@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, JsonValue, field_validator
 
-from core.constants import Currency, PaymentStatus
+from core.constants import Currency, PaymentStatus, WebhookStatus
 
 # Ограничения синхронизированы с колонками models.Payment: String(500) и String(2048).
 PAYMENT_DESCRIPTION_MAX_LENGTH: Final[int] = 500
@@ -83,6 +83,9 @@ class PaymentDetail(BaseModel):
         webhook_url: URL для уведомления о результате обработки.
         created_at: Дата и время создания платежа.
         processed_at: Дата и время завершения обработки шлюзом, если обработка завершена.
+        webhook_status: Статус доставки webhook-уведомления.
+        webhook_attempts: Суммарное количество HTTP-попыток доставки webhook.
+        webhook_last_error: Техническое описание последней ошибки доставки.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -98,6 +101,9 @@ class PaymentDetail(BaseModel):
     webhook_url: str
     created_at: datetime
     processed_at: datetime | None
+    webhook_status: WebhookStatus
+    webhook_attempts: int
+    webhook_last_error: str | None
 
 
 class PaymentEventPayload(BaseModel):

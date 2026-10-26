@@ -50,11 +50,28 @@ class OutboxStatus(StrEnum):
     PROCESSED = "processed"
 
 
+class WebhookStatus(StrEnum):
+    """Статусы доставки webhook-уведомления клиенту.
+
+    Attributes:
+        PENDING: Уведомление ещё не доставлено или ожидает повторной попытки.
+        DELIVERED: Уведомление успешно доставлено.
+        FAILED: Все попытки исчерпаны; требуется ручной replay.
+    """
+
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    FAILED = "failed"
+
+
 # Тип события, который пишется в таблицу outbox при создании платежа.
 EVENT_TYPE_PAYMENT_CREATED: Final[str] = "payment.created"
 
 # Ограничение колонки payments.idempotency_key (String(255)).
 IDEMPOTENCY_KEY_MAX_LENGTH: Final[int] = 255
+
+# Ограничение колонки payments.webhook_last_error (String(1024)).
+WEBHOOK_LAST_ERROR_MAX_LENGTH: Final[int] = 1024
 
 # Очередь основной обработки платежей и её маршрутизация при отказе.
 PAYMENTS_NEW_QUEUE: Final[str] = "payments.new"

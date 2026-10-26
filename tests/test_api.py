@@ -13,6 +13,7 @@ from core.constants import (
     Currency,
     OutboxStatus,
     PaymentStatus,
+    WebhookStatus,
 )
 from core.security import API_KEY_HEADER_NAME
 from schemas import CreatePaymentRequest
@@ -300,6 +301,9 @@ async def test_get_payment_returns_details(api_client: AsyncClient) -> None:
     assert body["webhook_url"] == payload["webhook_url"]
     assert body["status"] == PaymentStatus.PENDING.value
     assert body["processed_at"] is None
+    assert body["webhook_status"] == WebhookStatus.PENDING.value
+    assert body["webhook_attempts"] == 0
+    assert body["webhook_last_error"] is None
 
 
 async def test_get_unknown_payment_returns_404(api_client: AsyncClient) -> None:
