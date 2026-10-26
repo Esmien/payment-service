@@ -17,6 +17,8 @@ from core.constants import (
     INTERNAL_ERROR_MESSAGE,
     PAYMENT_NOT_FOUND_MESSAGE,
     UNAUTHORIZED_MESSAGE,
+    WEBHOOK_REPLAY_FAILED_MESSAGE,
+    WEBHOOK_REPLAY_NOT_ALLOWED_MESSAGE,
 )
 
 # Ключ тела ответа с сообщением для клиента; совпадает с форматом FastAPI HTTPException.
@@ -99,6 +101,36 @@ class WebhookDeliveryError(AppError):
 
     # Поля приходят через setattr(**context) в AppError.__init__, как у PaymentNotFoundError.
     url: str
+    attempts: int
+
+
+class WebhookReplayNotAllowedError(AppError):
+    """Повторная отправка webhook недоступна для текущего состояния платежа (HTTP 409).
+
+    Attributes:
+        payment_id: Идентификатор платежа.
+        webhook_status: Текущий статус доставки webhook.
+    """
+
+    http_status_code: ClassVar[int] = HTTPStatus.CONFLICT
+    client_message: ClassVar[str] = WEBHOOK_REPLAY_NOT_ALLOWED_MESSAGE
+
+    payment_id: UUID
+    webhook_status: str
+
+
+class WebhookReplayFailedError(AppError):
+    """Повторная отправка webhook не удалась после всех попыток (HTTP 502).
+
+    Attributes:
+        payment_id: Идентификатор платежа.
+        attempts: Количество выполненных HTTP-попыток.
+    """
+
+    http_status_code: ClassVar[int] = HTTPStatus.BAD_GATEWAY
+    client_message: ClassVar[str] = WEBHOOK_REPLAY_FAILED_MESSAGE
+
+    payment_id: UUID
     attempts: int
 
 

@@ -111,3 +111,7 @@ IDEMPOTENCY_CONFLICT_MESSAGE: Final[str] = (
 )
 UNAUTHORIZED_MESSAGE: Final[str] = "Неверный или отсутствующий API-ключ. Проверьте заголовок X-API-Key."
 INTERNAL_ERROR_MESSAGE: Final[str] = "Внутренняя ошибка сервера. Повторите запрос позже."
+WEBHOOK_REPLAY_NOT_ALLOWED_MESSAGE: Final[str] = (
+    "Повторная отправка webhook доступна только для платежей с неудачной доставкой."
+)
+WEBHOOK_REPLAY_FAILED_MESSAGE: Final[str] = "Webhook не удалось доставить повторно. Проверьте URL и попробуйте позже."

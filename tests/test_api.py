@@ -1,6 +1,8 @@
 """Интеграционные тесты REST API платежей (TASK-3.2)."""
 
+from datetime import UTC, datetime
 from typing import Any, Final
+from uuid import uuid4
 
 from httpx import AsyncClient
 
@@ -10,14 +12,25 @@ from core.constants import (
     IDEMPOTENCY_KEY_MAX_LENGTH,
     PAYMENT_NOT_FOUND_MESSAGE,
     UNAUTHORIZED_MESSAGE,
+    WEBHOOK_REPLAY_FAILED_MESSAGE,
+    WEBHOOK_REPLAY_NOT_ALLOWED_MESSAGE,
     Currency,
     OutboxStatus,
     PaymentStatus,
     WebhookStatus,
 )
+from core.exceptions import WebhookDeliveryError
 from core.security import API_KEY_HEADER_NAME
+from core.utils import RETRY_MAX_ATTEMPTS
+from models import Payment
 from schemas import CreatePaymentRequest
-from tests.conftest import TEST_API_KEY, InMemoryPaymentRepository, InMemoryUnitOfWork, PaymentFactory
+from tests.conftest import (
+    TEST_API_KEY,
+    InMemoryPaymentRepository,
+    InMemoryUnitOfWork,
+    InMemoryWebhookSender,
+    PaymentFactory,
+)
 
 PAYMENTS_URL: Final[str] = "/api/v1/payments"
 IDEMPOTENCY_KEY_HEADER_NAME: Final[str] = "Idempotency-Key"
@@ -59,6 +72,41 @@ def _payment_payload(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def _mark_webhook_failed(
+    *,
+    payment: Payment,
+    attempts: int = RETRY_MAX_ATTEMPTS,
+    error: str = "previous failure",
+) -> None:
+    """Переводит платеж в состояние «webhook исчерпал попытки».
+
+    Args:
+        payment: ORM-модель платежа из in-memory репозитория.
+        attempts: Накопленное количество попыток.
+        error: Текст последней ошибки.
+    """
+    payment.status = PaymentStatus.SUCCEEDED.value
+    payment.processed_at = datetime.now(tz=UTC)
+    payment.webhook_status = WebhookStatus.FAILED.value
+    payment.webhook_attempts = attempts
+    payment.webhook_last_error = error
+
+
+async def _create_payment(*, api_client: AsyncClient, idempotency_key: str) -> None:
+    """Создает платеж через API и проверяет ответ 202.
+
+    Args:
+        api_client: HTTP-клиент поверх ASGI-приложения.
+        idempotency_key: Ключ идемпотентности создаваемого платежа.
+    """
+    response = await api_client.post(
+        url=PAYMENTS_URL,
+        json=_payment_payload(),
+        headers=_auth_headers(idempotency_key=idempotency_key),
+    )
+    assert response.status_code == 202
 
 
 async def test_create_payment_without_api_key_returns_401(api_client: AsyncClient) -> None:
@@ -340,6 +388,104 @@ async def test_get_payment_without_api_key_returns_401(api_client: AsyncClient) 
     """
     response = await api_client.get(
         url=f"{PAYMENTS_URL}/3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        headers=_auth_headers(api_key=None),
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": UNAUTHORIZED_MESSAGE}
+
+
+async def test_replay_webhook_delivers_after_failure(
+    api_client: AsyncClient,
+    payment_repository: InMemoryPaymentRepository,
+    webhook_sender: InMemoryWebhookSender,
+) -> None:
+    """Replay успешно доставляет webhook после DLQ и обновляет состояние платежа."""
+    await _create_payment(api_client=api_client, idempotency_key="replay-success")
+    payment = payment_repository.payments["replay-success"]
+    _mark_webhook_failed(payment=payment)
+    webhook_sender.attempts = 2
+
+    response = await api_client.post(
+        url=f"{PAYMENTS_URL}/{payment.id}/webhook/replay",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["webhook_status"] == WebhookStatus.DELIVERED.value
+    assert body["webhook_attempts"] == RETRY_MAX_ATTEMPTS + 2
+    assert body["webhook_last_error"] is None
+
+    assert len(webhook_sender.calls) == 1
+    url, payload = webhook_sender.calls[0]
+    assert url == payment.webhook_url
+    assert payload.payment_id == payment.id
+    assert payload.status == PaymentStatus.SUCCEEDED
+
+
+async def test_replay_webhook_failure_returns_502_and_persists_failed(
+    api_client: AsyncClient,
+    payment_repository: InMemoryPaymentRepository,
+    webhook_sender: InMemoryWebhookSender,
+) -> None:
+    """Неудачный replay возвращает 502 и сохраняет failed/attempts/last_error."""
+    await _create_payment(api_client=api_client, idempotency_key="replay-failure")
+    payment = payment_repository.payments["replay-failure"]
+    _mark_webhook_failed(payment=payment)
+    webhook_sender.error = WebhookDeliveryError(
+        internal_message="webhook replay failed",
+        url=payment.webhook_url,
+        attempts=RETRY_MAX_ATTEMPTS,
+    )
+
+    response = await api_client.post(
+        url=f"{PAYMENTS_URL}/{payment.id}/webhook/replay",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": WEBHOOK_REPLAY_FAILED_MESSAGE}
+    assert payment.webhook_status == WebhookStatus.FAILED.value
+    assert payment.webhook_attempts == RETRY_MAX_ATTEMPTS * 2
+    assert payment.webhook_last_error == "webhook replay failed"
+    assert len(webhook_sender.calls) == 1
+
+
+async def test_replay_webhook_not_allowed_returns_409(
+    api_client: AsyncClient,
+    payment_repository: InMemoryPaymentRepository,
+    webhook_sender: InMemoryWebhookSender,
+) -> None:
+    """Replay для webhook в статусе pending отклоняется без отправки."""
+    await _create_payment(api_client=api_client, idempotency_key="replay-not-allowed")
+    payment = payment_repository.payments["replay-not-allowed"]
+
+    response = await api_client.post(
+        url=f"{PAYMENTS_URL}/{payment.id}/webhook/replay",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": WEBHOOK_REPLAY_NOT_ALLOWED_MESSAGE}
+    assert webhook_sender.calls == []
+
+
+async def test_replay_webhook_unknown_payment_returns_404(api_client: AsyncClient) -> None:
+    """Replay для неизвестного платежа возвращает 404."""
+    response = await api_client.post(
+        url=f"{PAYMENTS_URL}/{uuid4()}/webhook/replay",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": PAYMENT_NOT_FOUND_MESSAGE}
+
+
+async def test_replay_webhook_without_api_key_returns_401(api_client: AsyncClient) -> None:
+    """Replay без X-API-Key отклоняется до вызова сервиса."""
+    response = await api_client.post(
+        url=f"{PAYMENTS_URL}/{uuid4()}/webhook/replay",
         headers=_auth_headers(api_key=None),
     )
 

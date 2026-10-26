@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, status
 
-from api.deps import PaymentServiceDepends
+from api.deps import PaymentServiceDepends, WebhookReplayServiceDepends
 from core.constants import IDEMPOTENCY_KEY_MAX_LENGTH
 from core.security import verify_api_key
 from schemas import CreatePaymentRequest, PaymentCreatedResponse, PaymentDetail
@@ -83,3 +83,27 @@ async def get_payment(*, payment_id: UUID, service: PaymentServiceDepends) -> Pa
         PaymentNotFoundError: Если платеж с указанным идентификатором не найден.
     """
     return await service.get_payment_by_id(payment_id=payment_id)
+
+
+@router.post(
+    path="/{payment_id}/webhook/replay",
+    response_model=PaymentDetail,
+    status_code=status.HTTP_200_OK,
+    summary="Повторная отправка webhook",
+)
+async def replay_webhook(*, payment_id: UUID, service: WebhookReplayServiceDepends) -> PaymentDetail:
+    """Повторно отправляет webhook для платежа с неудачной доставкой.
+
+    Args:
+        payment_id: Идентификатор платежа из пути запроса.
+        service: Сервис повторной доставки webhook из DI-контейнера FastAPI.
+
+    Returns:
+        Детальная информация о платеже с обновленным статусом доставки webhook.
+
+    Raises:
+        PaymentNotFoundError: Если платеж с указанным идентификатором не найден.
+        WebhookReplayNotAllowedError: Если webhook не находится в статусе failed.
+        WebhookReplayFailedError: Если повторная доставка не удалась после всех попыток.
+    """
+    return await service.replay(payment_id=payment_id)
