@@ -7,6 +7,7 @@ from httpx import AsyncClient
 from core.constants import (
     EVENT_TYPE_PAYMENT_CREATED,
     IDEMPOTENCY_CONFLICT_MESSAGE,
+    IDEMPOTENCY_KEY_MAX_LENGTH,
     PAYMENT_NOT_FOUND_MESSAGE,
     UNAUTHORIZED_MESSAGE,
     Currency,
@@ -101,6 +102,51 @@ async def test_create_payment_without_idempotency_key_returns_422(api_client: As
         url=PAYMENTS_URL,
         json=_payment_payload(),
         headers=_auth_headers(),
+    )
+
+    assert response.status_code == 422
+
+
+async def test_create_payment_with_max_length_idempotency_key_returns_202(api_client: AsyncClient) -> None:
+    """Ключ максимальной длины, помещающийся в колонку, принимается.
+
+    Args:
+        api_client: HTTP-клиент поверх ASGI-приложения.
+    """
+    response = await api_client.post(
+        url=PAYMENTS_URL,
+        json=_payment_payload(),
+        headers=_auth_headers(idempotency_key="k" * IDEMPOTENCY_KEY_MAX_LENGTH),
+    )
+
+    assert response.status_code == 202
+
+
+async def test_create_payment_with_too_long_idempotency_key_returns_422(api_client: AsyncClient) -> None:
+    """Ключ длиннее колонки отклоняется валидацией, а не падает 500 на INSERT.
+
+    Args:
+        api_client: HTTP-клиент поверх ASGI-приложения.
+    """
+    response = await api_client.post(
+        url=PAYMENTS_URL,
+        json=_payment_payload(),
+        headers=_auth_headers(idempotency_key="k" * (IDEMPOTENCY_KEY_MAX_LENGTH + 1)),
+    )
+
+    assert response.status_code == 422
+
+
+async def test_create_payment_with_empty_idempotency_key_returns_422(api_client: AsyncClient) -> None:
+    """Пустой Idempotency-Key отклоняется валидацией.
+
+    Args:
+        api_client: HTTP-клиент поверх ASGI-приложения.
+    """
+    response = await api_client.post(
+        url=PAYMENTS_URL,
+        json=_payment_payload(),
+        headers=_auth_headers(idempotency_key=""),
     )
 
     assert response.status_code == 422

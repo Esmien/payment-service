@@ -53,6 +53,9 @@ class OutboxStatus(StrEnum):
 # Тип события, который пишется в таблицу outbox при создании платежа.
 EVENT_TYPE_PAYMENT_CREATED: Final[str] = "payment.created"
 
+# Ограничение колонки payments.idempotency_key (String(255)).
+IDEMPOTENCY_KEY_MAX_LENGTH: Final[int] = 255
+
 # Очередь основной обработки платежей и её маршрутизация при отказе.
 PAYMENTS_NEW_QUEUE: Final[str] = "payments.new"
 PAYMENTS_DLX_EXCHANGE: Final[str] = "payments.dlx"

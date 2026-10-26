@@ -9,7 +9,7 @@ from sqlalchemy import CheckConstraint, DateTime, Numeric, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from core.constants import OutboxStatus, PaymentStatus
+from core.constants import IDEMPOTENCY_KEY_MAX_LENGTH, OutboxStatus, PaymentStatus
 from core.engine import Base
 
 
@@ -39,7 +39,12 @@ class Payment(Base):
     # Атрибут назван metadata_, т.к. имя metadata зарезервировано в DeclarativeBase.
     metadata_: Mapped[dict[str, Any]] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(20), nullable=False, index=True, default=PaymentStatus.PENDING)
-    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(IDEMPOTENCY_KEY_MAX_LENGTH),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
     webhook_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

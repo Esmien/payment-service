@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, status
 
 from api.deps import PaymentServiceDepends
+from core.constants import IDEMPOTENCY_KEY_MAX_LENGTH
 from core.security import verify_api_key
 from schemas import CreatePaymentRequest, PaymentCreatedResponse, PaymentDetail
 
@@ -13,7 +14,17 @@ IDEMPOTENCY_KEY_HEADER_NAME: Final[str] = "Idempotency-Key"
 
 # Заголовок объявлен без значения по умолчанию, поэтому он обязателен:
 # при его отсутствии FastAPI сам вернет 422 Unprocessable Entity.
-IdempotencyKeyHeader = Annotated[str, Header(alias=IDEMPOTENCY_KEY_HEADER_NAME, description="Ключ идемпотентности")]
+# max_length совпадает с payments.idempotency_key (String(255)): длинный ключ
+# должен отсекаться валидацией, а не падать 500 на INSERT.
+IdempotencyKeyHeader = Annotated[
+    str,
+    Header(
+        alias=IDEMPOTENCY_KEY_HEADER_NAME,
+        description="Ключ идемпотентности",
+        min_length=1,
+        max_length=IDEMPOTENCY_KEY_MAX_LENGTH,
+    ),
+]
 
 router = APIRouter(
     prefix="/payments",
