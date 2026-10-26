@@ -1,40 +1,13 @@
 """Тесты моделей Payment и OutboxEvent на реальной PostgreSQL."""
 
-from collections.abc import AsyncIterator
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.config import get_settings
 from core.constants import Currency, OutboxStatus, PaymentStatus
-from core.engine import Base
 from models import OutboxEvent, Payment
-
-
-@pytest.fixture
-async def session() -> AsyncIterator[AsyncSession]:
-    """Создает таблицы и отдает сессию; после теста очищает записи.
-
-    Yields:
-        Асинхронная сессия SQLAlchemy.
-    """
-    # Движок создается в фикстуре, чтобы пул соединений не переживал границы event loop теста.
-    test_engine = create_async_engine(url=str(get_settings().database_url))
-    async with test_engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(bind=test_engine, expire_on_commit=False, class_=AsyncSession)
-    async with session_factory() as db_session:
-        yield db_session
-        await db_session.rollback()
-        await db_session.execute(delete(OutboxEvent))
-        await db_session.execute(delete(Payment))
-        await db_session.commit()
-
-    await test_engine.dispose()
 
 
 def _build_payment(*, idempotency_key: str) -> Payment:

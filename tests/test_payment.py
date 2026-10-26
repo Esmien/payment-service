@@ -1,17 +1,14 @@
 """Тесты сервиса создания и получения платежей (TASK-3.1)."""
 
-from collections.abc import AsyncIterator
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from core.config import get_settings
 from core.constants import EVENT_TYPE_PAYMENT_CREATED, Currency, OutboxStatus, PaymentStatus
-from core.engine import Base
 from core.exceptions import IdempotencyConflictError, PaymentNotFoundError
 from core.uow import UnitOfWork
 from models import OutboxEvent, Payment
@@ -19,21 +16,6 @@ from schemas import CreatePaymentRequest
 from services.payment_service import PaymentService
 
 TEST_IDEMPOTENCY_KEY = "test-key-1"
-
-
-@pytest.fixture
-async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Пересоздает таблицы в тестовой БД и отдает фабрику сессий.
-
-    Yields:
-        Фабрика асинхронных сессий SQLAlchemy.
-    """
-    engine = create_async_engine(str(get_settings().database_url))
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.drop_all)
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
 
 
 def _build_request(**overrides: Any) -> CreatePaymentRequest:
