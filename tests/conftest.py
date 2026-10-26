@@ -1,9 +1,7 @@
-"""Общие фикстуры интеграционных тестов API: Unit of Work в памяти и ASGI-клиент.
+"""Общие фикстуры тестов: in-memory API, тестовая БД и ASGI-клиент."""
 
-# Используется in-memory репозиторий вместо реального PostgreSQL,
-# чтобы тесты API были детерминированными и не зависели от поднятой БД.
-"""
-
+import asyncio
+import os
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Final
@@ -12,17 +10,23 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from api.app import app
 from api.deps import get_uow
 from core.config import Settings, get_settings
 from core.constants import EVENT_TYPE_PAYMENT_CREATED, OutboxStatus, PaymentStatus
+from core.engine import Base
 from models import OutboxEvent, Payment
 from schemas import CreatePaymentRequest, PaymentEventPayload
 
 TEST_API_KEY: Final[str] = "test-api-key"
 BASE_URL: Final[str] = "http://testserver"
+TEST_DATABASE_NAME: Final[str] = "payments_test"
+ADMIN_DATABASE_NAME: Final[str] = "postgres"
 
 PaymentFactory = Callable[..., Payment]
 
@@ -248,3 +252,158 @@ async def api_client(uow: InMemoryUnitOfWork, test_settings: Settings) -> AsyncI
 
     # app - модульный синглтон, поэтому подмены обязательно снимаем, чтобы они не протекали в другие тесты.
     app.dependency_overrides.clear()
+
+
+def _resolve_test_database_url() -> URL:
+    """Возвращает URL отдельной тестовой БД.
+
+    По умолчанию берется БД из ``DATABASE_URL`` и заменяется на ``payments_test``.
+    Полный URL можно переопределить через ``TEST_DATABASE_URL``.
+
+    Returns:
+        URL тестовой БД.
+    """
+    override = os.getenv("TEST_DATABASE_URL")
+    if override:
+        return make_url(override)
+
+    base_url = make_url(str(get_settings().database_url))
+    return base_url.set(database=TEST_DATABASE_NAME)
+
+
+async def _ensure_database(*, url: URL) -> None:
+    """Создает тестовую БД, если ее еще нет.
+
+    Args:
+        url: URL тестовой БД.
+
+    Raises:
+        sqlalchemy.exc.DBAPIError: Если PostgreSQL недоступен или нет прав на создание БД.
+    """
+    admin_url = url.set(database=ADMIN_DATABASE_NAME)
+    admin_engine = create_async_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin_engine.connect() as connection:
+            exists = await connection.scalar(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                {"name": url.database},
+            )
+            if exists:
+                return
+
+            database_name = (url.database or TEST_DATABASE_NAME).replace('"', '""')
+            await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+    finally:
+        await admin_engine.dispose()
+
+
+async def _prepare_test_schema(*, url: URL) -> None:
+    """Пересоздает схему в тестовой БД.
+
+    Args:
+        url: URL тестовой БД.
+    """
+    engine = create_async_engine(url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.drop_all)
+            await connection.run_sync(Base.metadata.create_all)
+    finally:
+        await engine.dispose()
+
+
+async def _truncate_tables(*, engine: AsyncEngine) -> None:
+    """Очищает таблицы приложения и сбрасывает sequences.
+
+    Args:
+        engine: Движок тестовой БД.
+    """
+    tables = Base.metadata.sorted_tables
+    if not tables:
+        return
+
+    table_names = ", ".join(f'"{table.name}"' for table in tables)
+    async with engine.begin() as connection:
+        await connection.execute(text(f"TRUNCATE TABLE {table_names} RESTART IDENTITY CASCADE"))
+
+
+@pytest.fixture(scope="session")
+def test_database_url() -> URL:
+    """Готовит отдельную тестовую БД и возвращает ее URL.
+
+    Если PostgreSQL недоступен, тесты, которым нужна БД, пропускаются.
+
+    Returns:
+        URL тестовой БД.
+    """
+    url = _resolve_test_database_url()
+    try:
+        asyncio.run(_ensure_database(url=url))
+        asyncio.run(_prepare_test_schema(url=url))
+    except OSError as exc:
+        pytest.skip(f"PostgreSQL is not available: {exc}")
+    except OperationalError as exc:
+        pytest.skip(f"PostgreSQL is not available: {exc}")
+
+    return url
+
+
+@pytest.fixture
+async def db_engine(test_database_url: URL) -> AsyncIterator[AsyncEngine]:
+    """Создает движок для тестовой БД.
+
+    Args:
+        test_database_url: URL тестовой БД.
+
+    Yields:
+        Асинхронный движок SQLAlchemy.
+    """
+    engine = create_async_engine(test_database_url, pool_pre_ping=True)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+def db_session_factory(db_engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
+    """Возвращает фабрику сессий для тестовой БД.
+
+    Args:
+        db_engine: Движок тестовой БД.
+
+    Returns:
+        Фабрика асинхронных сессий.
+    """
+    return async_sessionmaker(bind=db_engine, expire_on_commit=False)
+
+
+@pytest.fixture
+async def session_factory(
+    db_engine: AsyncEngine,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Отдает фабрику сессий и очищает таблицы до/после теста.
+
+    Args:
+        db_engine: Движок тестовой БД.
+        db_session_factory: Фабрика сессий для тестовой БД.
+
+    Yields:
+        Фабрика сессий с чистыми таблицами.
+    """
+    await _truncate_tables(engine=db_engine)
+    yield db_session_factory
+    await _truncate_tables(engine=db_engine)
+
+
+@pytest.fixture
+async def session(session_factory: async_sessionmaker[AsyncSession]) -> AsyncIterator[AsyncSession]:
+    """Отдает сессию тестовой БД с очисткой таблиц до/после теста.
+
+    Args:
+        session_factory: Фабрика сессий с изоляцией таблиц.
+
+    Yields:
+        Асинхронная сессия SQLAlchemy.
+    """
+    async with session_factory() as db_session:
+        yield db_session
