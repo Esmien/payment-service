@@ -14,6 +14,8 @@ DEFAULT_DATABASE_URL: Final[str] = "postgresql+asyncpg://payments:payments@local
 DEFAULT_RABBITMQ_URL: Final[str] = "amqp://guest:guest@localhost:5672/"
 DEFAULT_OUTBOX_POLL_INTERVAL_SECONDS: Final[float] = 1.0
 DEFAULT_OUTBOX_BATCH_SIZE: Final[int] = 100
+DEFAULT_OUTBOX_RETENTION_DAYS: Final[int] = 7
+DEFAULT_OUTBOX_RETENTION_INTERVAL_SECONDS: Final[float] = 3600.0
 DEFAULT_WEBHOOK_TIMEOUT_SECONDS: Final[float] = 10.0
 
 
@@ -26,6 +28,8 @@ class Settings(BaseSettings):
         api_key: Статический ключ для заголовка X-API-Key. Обязателен.
         outbox_poll_interval_seconds: Пауза между циклами опроса таблицы outbox.
         outbox_batch_size: Максимальное количество событий outbox за один цикл.
+        outbox_retention_days: Сколько дней хранить опубликованные события outbox.
+        outbox_retention_interval_seconds: Пауза между запусками очистки outbox.
         webhook_timeout_seconds: Таймаут одного HTTP-запроса вебхука.
         log_level: Минимальный уровень логирования Loguru.
     """
@@ -43,9 +47,14 @@ class Settings(BaseSettings):
     # Field(...) делает поле обязательным и не даёт mypy требовать аргумент в конструкторе.
     api_key: SecretStr = Field(...)
     # gt=0 запрещает нули и отрицательные значения: нулевая пауза опроса перегрузит БД.
-    # Нулевой размер пачки или таймаут тоже бессмысленны, поэтому проверяем все три поля.
+    # Нулевые размер пачки, срок/интервал retention и таймаут тоже бессмысленны.
     outbox_poll_interval_seconds: float = Field(default=DEFAULT_OUTBOX_POLL_INTERVAL_SECONDS, gt=0)
     outbox_batch_size: int = Field(default=DEFAULT_OUTBOX_BATCH_SIZE, gt=0)
+    outbox_retention_days: int = Field(default=DEFAULT_OUTBOX_RETENTION_DAYS, gt=0)
+    outbox_retention_interval_seconds: float = Field(
+        default=DEFAULT_OUTBOX_RETENTION_INTERVAL_SECONDS,
+        gt=0,
+    )
     webhook_timeout_seconds: float = Field(default=DEFAULT_WEBHOOK_TIMEOUT_SECONDS, gt=0)
     log_level: str = DEFAULT_LOG_LEVEL
 

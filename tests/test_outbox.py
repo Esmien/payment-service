@@ -7,12 +7,12 @@ from uuid import UUID, uuid4
 
 import pytest
 from faststream.rabbit import RabbitQueue
-from sqlalchemy import Select
+from sqlalchemy import Delete, Select
 from sqlalchemy.dialects import postgresql
 
 from core.constants import EVENT_TYPE_PAYMENT_CREATED, PAYMENTS_NEW_QUEUE, OutboxStatus
 from models import OutboxEvent
-from services.outbox import OutboxRelay, publish_pending_events
+from services.outbox import OutboxRelay, cleanup_processed_events, publish_pending_events
 
 
 class FakeScalarResult:
@@ -55,6 +55,18 @@ class FakeResult:
         return FakeScalarResult(events=self._events)
 
 
+class FakeDeleteResult:
+    """Результат DELETE с количеством удалённых строк."""
+
+    def __init__(self, *, rowcount: int) -> None:
+        """Сохраняет количество удалённых строк.
+
+        Args:
+            rowcount: Сколько строк якобы удалил DELETE.
+        """
+        self.rowcount = rowcount
+
+
 class FakeSession:
     """Сессия-заглушка: фиксирует SQL, отдаёт pending-события и эмулирует commit/rollback.
 
@@ -63,30 +75,35 @@ class FakeSession:
     ORM-атрибутов, которые в PostgreSQL были бы отменены.
     """
 
-    def __init__(self, *, events: list[OutboxEvent]) -> None:
+    def __init__(self, *, events: list[OutboxEvent], delete_rowcount: int = 0) -> None:
         """Инициализирует сессию с заданным набором событий.
 
         Args:
             events: События, хранящиеся «в БД».
+            delete_rowcount: Количество строк, которое вернёт DELETE.
         """
         self._events = events
+        self._delete_rowcount = delete_rowcount
         self._committed_state: dict[UUID, tuple[str, datetime | None]] = {
             event.id: (event.status, event.processed_at) for event in events
         }
-        self.statements: list[Select[Any]] = []
+        self.statements: list[Select[Any] | Delete] = []
         self.commits = 0
         self.rollbacks = 0
 
-    async def execute(self, statement: Select[Any]) -> FakeResult:
-        """Эмулирует выборку pending-событий.
+    async def execute(self, statement: Select[Any] | Delete) -> FakeResult | FakeDeleteResult:
+        """Эмулирует выборку pending-событий или DELETE для retention.
 
         Args:
             statement: SQL-запрос, который нужно запомнить для проверок.
 
         Returns:
-            Результат с событиями в статусе ``pending``.
+            Результат выборки либо результат DELETE с заданным ``rowcount``.
         """
         self.statements.append(statement)
+        if isinstance(statement, Delete):
+            return FakeDeleteResult(rowcount=self._delete_rowcount)
+
         pending_events = [event for event in self._events if event.status == OutboxStatus.PENDING.value]
         return FakeResult(events=pending_events)
 
@@ -255,8 +272,10 @@ async def test_pending_events_query_uses_skip_locked() -> None:
         limit=5,
     )
 
+    statement = session.statements[0]
+    assert isinstance(statement, Select)
     compiled_sql = str(
-        session.statements[0].compile(
+        statement.compile(
             dialect=postgresql.dialect(),
             compile_kwargs={"literal_binds": True},
         )
@@ -324,6 +343,51 @@ async def test_broker_failure_mid_batch_rolls_back_whole_batch() -> None:
     assert publisher.attempts == 2
 
 
+async def test_cleanup_processed_events_uses_status_and_created_at_cutoff() -> None:
+    """Retention удаляет только processed-события старше cutoff и коммитит транзакцию."""
+    session = FakeSession(events=[], delete_rowcount=3)
+    cutoff = datetime.now(tz=UTC)
+
+    deleted_count = await cleanup_processed_events(
+        session=session,  # type: ignore[arg-type]
+        older_than=cutoff,
+    )
+
+    assert deleted_count == 3
+    assert session.commits == 1
+    assert session.rollbacks == 0
+    statement = session.statements[0]
+    assert isinstance(statement, Delete)
+    compiled_sql = str(
+        statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "DELETE FROM outbox" in compiled_sql
+    assert "outbox.status =" in compiled_sql
+    assert "outbox.created_at <" in compiled_sql
+
+
+async def test_relay_run_cleanup_deletes_old_events() -> None:
+    """Relay запускает retention в отдельной сессии и возвращает число удалённых событий."""
+    session = FakeSession(events=[], delete_rowcount=2)
+    relay = OutboxRelay(
+        publisher=FakePublisher(),
+        session_factory=FakeSessionFactory(session=session),  # type: ignore[arg-type]
+        queue=make_queue(),
+        poll_interval_seconds=0.01,
+        batch_size=10,
+        retention_days=7,
+        retention_interval_seconds=3600,
+    )
+
+    deleted_count = await relay.run_cleanup()
+
+    assert deleted_count == 2
+    assert session.commits == 1
+
+
 async def test_relay_continues_after_broker_error() -> None:
     """Релей переживает сбой брокера и публикует событие на следующей итерации."""
     event = make_outbox_event()
@@ -335,6 +399,8 @@ async def test_relay_continues_after_broker_error() -> None:
         queue=make_queue(),
         poll_interval_seconds=0.01,
         batch_size=10,
+        retention_days=7,
+        retention_interval_seconds=3600,
     )
 
     task = asyncio.create_task(relay.run())
@@ -361,6 +427,8 @@ async def test_relay_stops_by_event() -> None:
         queue=make_queue(),
         poll_interval_seconds=0.01,
         batch_size=10,
+        retention_days=7,
+        retention_interval_seconds=3600,
     )
 
     task = asyncio.create_task(relay.run())

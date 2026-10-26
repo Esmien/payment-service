@@ -1,13 +1,17 @@
 """Тесты моделей Payment и OutboxEvent на реальной PostgreSQL."""
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.constants import Currency, OutboxStatus, PaymentStatus
 from models import OutboxEvent, Payment
+from services.outbox import cleanup_processed_events
 
 
 def _build_payment(*, idempotency_key: str) -> Payment:
@@ -85,3 +89,39 @@ async def test_amount_must_be_positive(session: AsyncSession) -> None:
     session.add(payment)
     with pytest.raises(IntegrityError):
         await session.commit()
+
+
+async def test_cleanup_processed_events_deletes_only_old_processed(session: AsyncSession) -> None:
+    """Retention удаляет старые processed-события, не трогая pending и свежие processed."""
+    now = datetime.now(tz=UTC)
+    old_processed = OutboxEvent(
+        event_type="payment.created",
+        payload={"payment_id": str(uuid4())},
+        status=OutboxStatus.PROCESSED.value,
+        created_at=now - timedelta(days=10),
+        processed_at=now - timedelta(days=10),
+    )
+    fresh_processed = OutboxEvent(
+        event_type="payment.created",
+        payload={"payment_id": str(uuid4())},
+        status=OutboxStatus.PROCESSED.value,
+        created_at=now - timedelta(days=1),
+        processed_at=now - timedelta(days=1),
+    )
+    old_pending = OutboxEvent(
+        event_type="payment.created",
+        payload={"payment_id": str(uuid4())},
+        status=OutboxStatus.PENDING.value,
+        created_at=now - timedelta(days=10),
+    )
+    session.add_all([old_processed, fresh_processed, old_pending])
+    await session.commit()
+
+    deleted_count = await cleanup_processed_events(
+        session=session,
+        older_than=now - timedelta(days=7),
+    )
+
+    assert deleted_count == 1
+    remaining = (await session.execute(select(OutboxEvent))).scalars().all()
+    assert {event.id for event in remaining} == {fresh_processed.id, old_pending.id}

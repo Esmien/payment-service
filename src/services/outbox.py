@@ -2,14 +2,16 @@
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
-from typing import Any, Protocol
+from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol, cast
 
 from faststream.rabbit import RabbitQueue
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.constants import OutboxStatus
@@ -133,6 +135,43 @@ async def publish_pending_events(
     return published_count
 
 
+async def cleanup_processed_events(*, session: AsyncSession, older_than: datetime) -> int:
+    """Удаляет опубликованные события outbox, созданные раньше cutoff.
+
+    Политика хранения опирается на ``created_at``, а не на ``processed_at``: так DELETE
+    использует композитный индекс ``(status, created_at)``. Для outbox разница
+    между созданием и публикацией мала, поэтому возраст события — достаточный
+    критерий хранения. Pending-события не удаляются ни при каких условиях.
+
+    Args:
+        session: Асинхронная сессия SQLAlchemy.
+        older_than: Граница хранения; события с ``created_at < older_than`` удаляются.
+
+    Returns:
+        Количество удалённых событий.
+
+    Raises:
+        Exception: Любая ошибка БД; транзакция откатывается.
+    """
+    statement = delete(OutboxEvent).where(
+        OutboxEvent.status == OutboxStatus.PROCESSED.value,
+        OutboxEvent.created_at < older_than,
+    )
+
+    try:
+        # AsyncSession.execute типизирован как Result, но для DELETE фактический
+        # объект — CursorResult, у которого есть rowcount.
+        result = cast(CursorResult[Any], await session.execute(statement))
+        await session.commit()
+    except Exception:
+        # Откат обязателен: иначе сессия останется в failed-транзакции
+        # и следующий цикл relay не сможет продолжить работу.
+        await session.rollback()
+        raise
+
+    return result.rowcount
+
+
 class OutboxRelay:
     """Фоновый цикл публикации событий outbox в очередь ``payments.new``.
 
@@ -142,6 +181,8 @@ class OutboxRelay:
         _queue: Очередь, в которую публикуются события.
         _poll_interval_seconds: Пауза между циклами опроса outbox.
         _batch_size: Максимальное количество событий за один цикл.
+        _retention_days: Сколько дней хранить опубликованные события.
+        _retention_interval_seconds: Пауза между запусками очистки outbox.
         _stop_event: Событие, сигнализирующее о необходимости остановить цикл.
     """
 
@@ -153,6 +194,8 @@ class OutboxRelay:
         queue: RabbitQueue,
         poll_interval_seconds: float,
         batch_size: int,
+        retention_days: int,
+        retention_interval_seconds: float,
     ) -> None:
         """Инициализирует релей.
 
@@ -162,12 +205,16 @@ class OutboxRelay:
             queue: Очередь, в которую публикуются события.
             poll_interval_seconds: Пауза между циклами опроса outbox.
             batch_size: Максимальное количество событий за один цикл.
+            retention_days: Сколько дней хранить опубликованные события.
+            retention_interval_seconds: Пауза между запусками очистки outbox.
         """
         self._publisher = publisher
         self._session_factory = session_factory
         self._queue = queue
         self._poll_interval_seconds = poll_interval_seconds
         self._batch_size = batch_size
+        self._retention_days = retention_days
+        self._retention_interval_seconds = retention_interval_seconds
         self._stop_event = asyncio.Event()
 
     async def run_once(self) -> int:
@@ -187,8 +234,26 @@ class OutboxRelay:
                 limit=self._batch_size,
             )
 
+    async def run_cleanup(self) -> int:
+        """Удаляет processed-события старше настроенного срока хранения.
+
+        Returns:
+            Количество удалённых событий.
+
+        Raises:
+            Exception: Ошибка БД; вызывающий цикл логирует её и продолжает работу.
+        """
+        cutoff = datetime.now(tz=UTC) - timedelta(days=self._retention_days)
+        async with self._session_factory() as session:
+            deleted_count = await cleanup_processed_events(session=session, older_than=cutoff)
+
+        if deleted_count:
+            logger.info("Outbox retention deleted {} events older than {}", deleted_count, cutoff)
+
+        return deleted_count
+
     async def run(self) -> None:
-        """Крутит цикл публикации до вызова :meth:`stop`.
+        """Крутит цикл публикации и периодической очистки outbox до :meth:`stop`.
 
         Временные сбои БД или брокера не прерывают работу релея: ошибка логируется,
         и следующая итерация выполняется после паузы.
@@ -197,12 +262,17 @@ class OutboxRelay:
             None
         """
         logger.info(
-            "Outbox relay started: poll_interval={}s, batch_size={}",
+            "Outbox relay started: poll_interval={}s, batch_size={}, retention_days={}, retention_interval={}s",
             self._poll_interval_seconds,
             self._batch_size,
+            self._retention_days,
+            self._retention_interval_seconds,
         )
 
+        next_cleanup_at = time.monotonic()
+
         while not self._stop_event.is_set():
+            # Сначала публикуем pending-события: очистка не должна задерживать платежи.
             try:
                 published_count = await self.run_once()
             except Exception:
@@ -211,6 +281,16 @@ class OutboxRelay:
             else:
                 if published_count:
                     logger.info("Outbox relay published {} events", published_count)
+
+            if time.monotonic() >= next_cleanup_at:
+                try:
+                    await self.run_cleanup()
+                except Exception:
+                    # Очистка не должна ронять relay: таблица может быть временно недоступна.
+                    logger.exception("Outbox retention cleanup failed")
+                finally:
+                    # Даже после ошибки не долбим БД очисткой на каждой итерации.
+                    next_cleanup_at = time.monotonic() + self._retention_interval_seconds
 
             # Ожидание либо сигнала остановки, либо истечения интервала поллинга.
             # contextlib.suppress вместо pass: таймаут — штатное завершение ожидания.
