@@ -59,6 +59,21 @@ class PaymentRepository:
         """
         return await self._session.get(Payment, ident=payment_id)
 
+    async def get_by_id_for_update(self, *, payment_id: UUID) -> Payment | None:
+        """Возвращает платеж с блокировкой строки до конца транзакции.
+
+        Блокировка сериализует consumer'ов: второй экземпляр ждет коммита первого
+        и затем видит уже финальный статус, не запуская шлюз повторно.
+
+        Args:
+            payment_id: Идентификатор платежа.
+
+        Returns:
+            ORM-модель платежа либо None, если платеж не найден.
+        """
+        statement = select(Payment).where(Payment.id == payment_id).with_for_update()
+        return await self._session.scalar(statement)
+
     async def get_by_idempotency_key(self, *, idempotency_key: str) -> Payment | None:
         """Возвращает платеж по ключу идемпотентности.
 

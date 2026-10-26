@@ -113,7 +113,11 @@ class PaymentConsumer:
             RuntimeError: Если у финального платежа отсутствует ``processed_at``.
         """
         async with self._uow_factory() as uow:
-            payment = await uow.payment.get_by_id(payment_id=payload.payment_id)
+            # FOR UPDATE сериализует consumer'ов на строке платежа: второй ждет
+            # коммита первого и затем видит финальный статус. Падение между
+            # gateway и commit остается окном для повторного вызова; в проде
+            # нужен idempotency key на стороне провайдера.
+            payment = await uow.payment.get_by_id_for_update(payment_id=payload.payment_id)
             if payment is None:
                 raise PaymentNotFoundError(payment_id=payload.payment_id)
 

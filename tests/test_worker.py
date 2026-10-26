@@ -253,6 +253,17 @@ class FakePaymentRepository:
             return self._payment
         return None
 
+    async def get_by_id_for_update(self, *, payment_id: UUID) -> Payment | None:
+        """Эмулирует SELECT ... FOR UPDATE.
+
+        Args:
+            payment_id: Идентификатор платежа.
+
+        Returns:
+            Платеж или None, если он не найден.
+        """
+        return await self.get_by_id(payment_id=payment_id)
+
     async def update_processing_result(
         self,
         *,
