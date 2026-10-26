@@ -90,7 +90,16 @@ class UnauthorizedError(AppError):
 
 
 class WebhookDeliveryError(AppError):
-    """Webhook не удалось доставить после исчерпания всех попыток retry (уход в DLQ на уровне worker)."""
+    """Webhook не удалось доставить после исчерпания всех попыток retry (уход в DLQ на уровне worker).
+
+    Attributes:
+        url: URL, на который не удалось доставить уведомление (проставляется через context).
+        attempts: Количество выполненных попыток доставки.
+    """
+
+    # Поля приходят через setattr(**context) в AppError.__init__, как у PaymentNotFoundError.
+    url: str
+    attempts: int
 
 
 async def on_app_error(request: Request, exc: Exception) -> JSONResponse:

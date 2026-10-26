@@ -76,6 +76,11 @@ DLQ_ARGS: Final[QuorumQueueArgs] = {
     "x-delivery-limit": PAYMENTS_DLQ_DELIVERY_LIMIT,
 }
 
+# Эмулятор платежного шлюза: диапазон задержки обработки и вероятность успеха.
+GATEWAY_MIN_DELAY_SECONDS: Final[float] = 2.0
+GATEWAY_MAX_DELAY_SECONDS: Final[float] = 5.0
+GATEWAY_SUCCESS_PROBABILITY: Final[float] = 0.9
+
 # Уровень логирования по умолчанию, если он не задан в окружении.
 DEFAULT_LOG_LEVEL: Final[str] = "INFO"
 
