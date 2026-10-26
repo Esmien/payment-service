@@ -6,11 +6,12 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import httpx
 from loguru import logger
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity.wait import wait_base
 
 RETRY_MAX_ATTEMPTS: Final[int] = 3
 EXPONENTIAL_BACKOFF_MULTIPLIER: Final[int] = 1
@@ -20,7 +21,8 @@ EXPONENTIAL_BACKOFF_MAX_SECONDS: Final[int] = 10
 RETRY_AFTER_MAX_WAIT_SECONDS: Final[float] = 30.0
 RETRY_AFTER_HEADER: Final[str] = "Retry-After"
 
-_EXPONENTIAL_BACKOFF: Final = wait_exponential(
+# noinspection bad-assignment
+_EXPONENTIAL_BACKOFF: Final[wait_base] = wait_exponential(
     multiplier=EXPONENTIAL_BACKOFF_MULTIPLIER,
     min=EXPONENTIAL_BACKOFF_MIN_SECONDS,
     max=EXPONENTIAL_BACKOFF_MAX_SECONDS,
@@ -152,12 +154,16 @@ def external_api_retry[WrappedFn: Callable[..., Awaitable[Any]]](
     Returns:
         Декоратор, применимый к асинхронной функции.
     """
-    # retry() из tenacity типизирован как Any, поэтому тип декоратора задан явно.
-    return retry(
-        stop=stop_after_attempt(max_attempt_number=RETRY_MAX_ATTEMPTS),
-        wait=_wait_retry_after_or_exponential,
-        retry=retry_if_exception_type(exception_types=httpx.HTTPError),
-        before_sleep=_log_retry_attempt,
-        reraise=True,
-        sleep=sleep,
+    # retry() возвращает _AsyncRetryDecorator с перегруженным __call__: mypy не сводит его
+    # к Callable[[WrappedFn], WrappedFn], поэтому приводим тип явно, сохраняя точную сигнатуру.
+    return cast(
+        Callable[[WrappedFn], WrappedFn],
+        retry(
+            stop=stop_after_attempt(max_attempt_number=RETRY_MAX_ATTEMPTS),
+            wait=_wait_retry_after_or_exponential,
+            retry=retry_if_exception_type(exception_types=httpx.HTTPError),
+            before_sleep=_log_retry_attempt,
+            reraise=True,
+            sleep=sleep,
+        ),
     )

@@ -7,6 +7,8 @@
 from enum import StrEnum
 from typing import Final
 
+from faststream.rabbit.schemas.queue import QuorumQueueArgs
+
 
 class Currency(StrEnum):
     """Поддерживаемые валюты платежа.
@@ -56,6 +58,23 @@ PAYMENTS_NEW_QUEUE: Final[str] = "payments.new"
 PAYMENTS_DLX_EXCHANGE: Final[str] = "payments.dlx"
 PAYMENTS_DLQ_QUEUE: Final[str] = "payments.dlq"
 PAYMENTS_DLQ_ROUTING_KEY: Final[str] = "payments.dlq"
+
+# Quorum-очередь реплицирует сообщения и переживает потерю узла, в отличие от classic.
+QUORUM_QUEUE_TYPE: Final[str] = "quorum"
+
+# Лимит доставок в payments.new: после 3 redelivery сообщение уходит в DLX.
+# Это страховка от «ядовитого» сообщения, роняющего consumer до ручного Nack.
+PAYMENTS_NEW_DELIVERY_LIMIT: Final[int] = 3
+PAYMENTS_DLQ_DELIVERY_LIMIT: Final[int] = -1
+
+QUORUM_DELIVERY_ARGS: Final[QuorumQueueArgs] = {
+    "x-delivery-limit": PAYMENTS_NEW_DELIVERY_LIMIT,
+    "x-dead-letter-exchange": PAYMENTS_DLX_EXCHANGE,
+    "x-dead-letter-routing-key": PAYMENTS_DLQ_ROUTING_KEY,
+}
+DLQ_ARGS: Final[QuorumQueueArgs] = {
+    "x-delivery-limit": PAYMENTS_DLQ_DELIVERY_LIMIT,
+}
 
 # Уровень логирования по умолчанию, если он не задан в окружении.
 DEFAULT_LOG_LEVEL: Final[str] = "INFO"

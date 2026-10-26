@@ -1,14 +1,24 @@
 import asyncio
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from sqlalchemy import Connection
 
 from alembic import context
-from core.config import get_settings
-from core.engine import Base, engine
+
+# Alembic запускается из корня проекта, где пакеты лежат в src/, поэтому добавляем src в sys.path
+# до локальных импортов. Иначе `import models` может подхватить одноименный сторонний пакет,
+# и таблицы не попадут в Base.metadata (autogenerate выдаст пустую миграцию).
+SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from core.config import get_settings  # noqa: E402
+from core.engine import Base, engine  # noqa: E402
 
 # Импорт регистрирует таблицы моделей в Base.metadata для autogenerate.
-import models  # noqa: F401
+import models  # noqa: F401,E402
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -23,6 +33,10 @@ if config.config_file_name is not None:
 # % экранируется, т.к. ConfigParser трактует его как спецсимвол интерполяции.
 config.set_main_option("sqlalchemy.url", str(get_settings().database_url).replace("%", "%%"))
 target_metadata = Base.metadata
+
+# Страховка от «тихой» пустой миграции: если модели не зарегистрировались, падаем сразу.
+if not target_metadata.tables:
+    raise RuntimeError("No tables registered in Base.metadata: src/models.py was not imported")
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -60,7 +74,8 @@ def _do_run_migrations(connection: Connection) -> None:
     Args:
         connection: Соединение SQLAlchemy, полученное через ``AsyncConnection.run_sync``.
     """
-    context.configure(connection=connection, target_metadata=target_metadata)
+    # compare_type=True позволяет autogenerate отслеживать изменения типов колонок.
+    context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
 
     with context.begin_transaction():
         context.run_migrations()
