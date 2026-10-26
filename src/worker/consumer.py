@@ -3,14 +3,16 @@
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
+from uuid import UUID
 
 from faststream.exceptions import NackMessage
 from loguru import logger
 
-from core.constants import Currency, PaymentStatus
+from core.constants import PaymentStatus, WebhookStatus
 from core.exceptions import PaymentNotFoundError, WebhookDeliveryError
 from core.uow import IUnitOfWork, UnitOfWork
 from schemas import PaymentEventPayload, WebhookPayload
+from services.webhook import WebhookSender, build_webhook_payload
 
 
 class PaymentProcessor(Protocol):
@@ -21,22 +23,6 @@ class PaymentProcessor(Protocol):
 
         Returns:
             ``PaymentStatus.SUCCEEDED`` или ``PaymentStatus.FAILED``.
-        """
-        ...
-
-
-class WebhookSender(Protocol):
-    """Контракт отправки webhook-уведомления."""
-
-    async def send(self, *, url: str, payload: WebhookPayload) -> None:
-        """Отправляет уведомление на URL клиента.
-
-        Args:
-            url: URL клиента для получения уведомления.
-            payload: Тело уведомления.
-
-        Raises:
-            WebhookDeliveryError: Если доставить уведомление не удалось.
         """
         ...
 
@@ -88,8 +74,14 @@ class PaymentConsumer:
             raise NackMessage(requeue=False) from exc
 
         try:
-            await self._webhook_client.send(url=webhook_url, payload=webhook_payload)
+            attempts = await self._webhook_client.send(url=webhook_url, payload=webhook_payload)
         except WebhookDeliveryError as exc:
+            await self._record_webhook_result(
+                payment_id=payload.payment_id,
+                status=WebhookStatus.FAILED,
+                attempts=exc.attempts,
+                last_error=exc.internal_message,
+            )
             logger.error(
                 "Webhook delivery failed, sending to DLQ: payment_id={}, error={}",
                 payload.payment_id,
@@ -97,7 +89,58 @@ class PaymentConsumer:
             )
             raise NackMessage(requeue=False) from exc
 
+        await self._record_webhook_result(
+            payment_id=payload.payment_id,
+            status=WebhookStatus.DELIVERED,
+            attempts=attempts,
+            last_error=None,
+        )
         logger.info("Payment processed and webhook delivered: payment_id={}", payload.payment_id)
+
+    async def _record_webhook_result(
+        self,
+        *,
+        payment_id: UUID,
+        status: WebhookStatus,
+        attempts: int,
+        last_error: str | None,
+    ) -> None:
+        """Сохраняет результат доставки webhook в отдельной транзакции.
+
+        Ошибка записи не должна менять решение о судьбе сообщения: при успешной
+        доставке повторять webhook нельзя, а при неудачной сообщение всё равно
+        должно уйти в DLQ. Поэтому сбой БД здесь только логируется.
+
+        Args:
+            payment_id: Идентификатор платежа.
+            status: Статус доставки webhook.
+            attempts: Количество HTTP-попыток текущей доставки.
+            last_error: Техническое описание ошибки или None при успехе.
+
+        Returns:
+            None
+        """
+        try:
+            async with self._uow_factory() as uow:
+                payment = await uow.payment.get_by_id_for_update(payment_id=payment_id)
+                if payment is None:
+                    logger.error(
+                        "Payment disappeared before recording webhook result: payment_id={}",
+                        payment_id,
+                    )
+                    return
+
+                await uow.payment.update_webhook_result(
+                    payment=payment,
+                    status=status,
+                    attempts=attempts,
+                    last_error=last_error,
+                )
+                await uow.commit()
+        except Exception:
+            # Статус webhook — вспомогательные данные. Сбой их записи не должен
+            # приводить к повторной доставке уже успешного webhook.
+            logger.exception("Failed to persist webhook result: payment_id={}", payment_id)
 
     async def _process_payment(self, *, payload: PaymentEventPayload) -> tuple[str, WebhookPayload]:
         """Загружает платеж, при необходимости запускает шлюз и собирает webhook.
@@ -138,16 +181,4 @@ class PaymentConsumer:
                     payment.status,
                 )
 
-            processed_at = payment.processed_at
-            if processed_at is None:
-                # Инвариант: финальный статус всегда сохраняется вместе с processed_at.
-                raise RuntimeError(f"Payment {payment.id} has final status without processed_at")
-
-            return payment.webhook_url, WebhookPayload(
-                payment_id=payment.id,
-                status=PaymentStatus(payment.status),
-                amount=payment.amount,
-                currency=Currency(payment.currency),
-                metadata=payment.metadata_,
-                processed_at=processed_at,
-            )
+            return payment.webhook_url, build_webhook_payload(payment=payment)

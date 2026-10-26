@@ -22,14 +22,15 @@ from core.constants import (
     QUORUM_QUEUE_TYPE,
     Currency,
     PaymentStatus,
+    WebhookStatus,
 )
 from core.exceptions import WebhookDeliveryError
 from core.utils import RETRY_MAX_ATTEMPTS
 from models import Payment
 from schemas import PaymentEventPayload, WebhookPayload
-from services.webhook import WebhookClient
+from services.webhook import WebhookClient, WebhookSender
 from worker.broker import declare_topology, payments_dlq, payments_dlx, payments_new_queue
-from worker.consumer import PaymentConsumer, PaymentProcessor, WebhookSender
+from worker.consumer import PaymentConsumer, PaymentProcessor
 
 
 def test_payments_new_queue_is_quorum_with_dead_lettering() -> None:
@@ -214,12 +215,15 @@ class FakeWebhookSender:
         self._error = error
         self.calls: list[tuple[str, WebhookPayload]] = []
 
-    async def send(self, *, url: str, payload: WebhookPayload) -> None:
+    async def send(self, *, url: str, payload: WebhookPayload) -> int:
         """Запоминает вызов и при необходимости поднимает ошибку.
 
         Args:
             url: URL клиента.
             payload: Тело уведомления.
+
+        Returns:
+            Количество выполненных попыток доставки.
 
         Raises:
             WebhookDeliveryError: Если ошибка задана в конструкторе.
@@ -227,6 +231,7 @@ class FakeWebhookSender:
         self.calls.append((url, payload))
         if self._error is not None:
             raise self._error
+        return 1
 
 
 class FakePaymentRepository:
@@ -280,6 +285,26 @@ class FakePaymentRepository:
         """
         payment.status = status.value
         payment.processed_at = processed_at
+
+    async def update_webhook_result(
+        self,
+        *,
+        payment: Payment,
+        status: WebhookStatus,
+        attempts: int,
+        last_error: str | None,
+    ) -> None:
+        """Записывает результат доставки webhook в ORM-модель.
+
+        Args:
+            payment: Платеж, который нужно обновить.
+            status: Статус доставки webhook.
+            attempts: Количество HTTP-попыток текущей доставки.
+            last_error: Техническое описание ошибки или None при успехе.
+        """
+        payment.webhook_status = status.value
+        payment.webhook_attempts = (payment.webhook_attempts or 0) + attempts
+        payment.webhook_last_error = last_error
 
 
 class FakeUnitOfWork:
@@ -346,6 +371,9 @@ def _build_payment(
         webhook_url="https://example.com/webhook",
         created_at=datetime.now(tz=UTC),
         processed_at=processed_at,
+        webhook_status=WebhookStatus.PENDING.value,
+        webhook_attempts=0,
+        webhook_last_error=None,
     )
 
 
@@ -384,9 +412,12 @@ async def test_consumer_processes_pending_payment_and_sends_webhook() -> None:
     await consumer.handle(payload=PaymentEventPayload(payment_id=payment.id))
 
     assert gateway.calls == 1
-    assert uow.commits == 1
+    assert uow.commits == 2
     assert payment.status == PaymentStatus.SUCCEEDED.value
     assert payment.processed_at is not None
+    assert payment.webhook_status == WebhookStatus.DELIVERED.value
+    assert payment.webhook_attempts == 1
+    assert payment.webhook_last_error is None
     assert len(webhook.calls) == 1
 
     url, payload = webhook.calls[0]
@@ -410,7 +441,9 @@ async def test_consumer_skips_gateway_for_already_processed_payment() -> None:
     await consumer.handle(payload=PaymentEventPayload(payment_id=payment.id))
 
     assert gateway.calls == 0
-    assert uow.commits == 0
+    assert uow.commits == 1
+    assert payment.webhook_status == WebhookStatus.DELIVERED.value
+    assert payment.webhook_attempts == 1
     assert len(webhook.calls) == 1
     assert webhook.calls[0][1].status == PaymentStatus.SUCCEEDED
     assert webhook.calls[0][1].processed_at == processed_at
@@ -446,8 +479,11 @@ async def test_consumer_nacks_to_dlq_when_webhook_delivery_fails() -> None:
     assert attempts == RETRY_MAX_ATTEMPTS
     assert len(sleep.delays) == RETRY_MAX_ATTEMPTS - 1
     # Статус закоммичен до webhook: повторная доставка не запустит шлюз заново.
-    assert uow.commits == 1
+    assert uow.commits == 2
     assert payment.status == PaymentStatus.SUCCEEDED.value
+    assert payment.webhook_status == WebhookStatus.FAILED.value
+    assert payment.webhook_attempts == RETRY_MAX_ATTEMPTS
+    assert payment.webhook_last_error is not None
 
 
 async def test_consumer_nacks_to_dlq_when_payment_not_found() -> None:
