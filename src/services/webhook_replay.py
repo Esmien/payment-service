@@ -19,16 +19,21 @@ from services.webhook import WebhookSender, build_webhook_payload
 class WebhookReplayService:
     """Повторно отправляет webhook для платежа с неудачной доставкой.
 
-    Сервис работает в транзакции переданного Unit of Work. Строка платежа
-    блокируется через ``SELECT ... FOR UPDATE``, поэтому параллельный replay
-    или consumer не отправят уведомление одновременно.
+    HTTP-вызов выполняется вне транзакции: платёж читается и проверяется
+    в короткой транзакции, затем транзакция коммитится и соединение
+    возвращается в пул. Результат доставки записывается отдельной короткой
+    транзакцией.
+
+    Доставка webhook — at-least-once. Два параллельных replay могут отправить
+    уведомление дважды; это допустимо, клиент должен дедуплицировать
+    уведомления по ``payment_id``.
     """
 
     def __init__(self, *, uow: IUnitOfWork, webhook_client: WebhookSender) -> None:
         """Инициализирует сервис.
 
         Args:
-            uow: Unit of Work с активной транзакцией.
+            uow: Unit of Work с сессией для коротких транзакций.
             webhook_client: Клиент доставки webhook.
         """
         self._uow = uow
@@ -50,7 +55,7 @@ class WebhookReplayService:
             WebhookReplayFailedError: Если повторная доставка не удалась после
                 всех HTTP-попыток; статус failed при этом уже сохранен.
         """
-        payment = await self._uow.payment.get_by_id_for_update(payment_id=payment_id)
+        payment = await self._uow.payment.get_by_id(payment_id=payment_id)
         if payment is None:
             raise PaymentNotFoundError(payment_id=payment_id)
 
@@ -63,10 +68,17 @@ class WebhookReplayService:
                 webhook_status=payment.webhook_status,
             )
 
+        # URL и payload собираем до commit: после него ORM-атрибуты могут быть
+        # expired при другой настройке sessionmaker.
+        webhook_url = payment.webhook_url
         payload = build_webhook_payload(payment=payment)
 
+        # Закрываем транзакцию чтения: HTTP не должен удерживать соединение
+        # из пула и row lock.
+        await self._uow.commit()
+
         try:
-            attempts = await self._webhook_client.send(url=payment.webhook_url, payload=payload)
+            attempts = await self._webhook_client.send(url=webhook_url, payload=payload)
         except WebhookDeliveryError as exc:
             await self._uow.payment.update_webhook_result(
                 payment=payment,
@@ -88,7 +100,9 @@ class WebhookReplayService:
             attempts=attempts,
             last_error=None,
         )
+        # DTO собираем до commit: после него ORM-атрибуты могут быть expired.
+        payment_detail = PaymentDetail.model_validate(payment)
         await self._uow.commit()
         logger.info("Webhook replay delivered: payment_id={}, attempts={}", payment_id, attempts)
 
-        return PaymentDetail.model_validate(payment)
+        return payment_detail

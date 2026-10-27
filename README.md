@@ -22,7 +22,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-- API: `http://localhost:8000`, Swagger: `http://localhost:8000/docs`
+- API: `http://localhost:<API_PORT>` (по умолчанию `8000`), Swagger: `http://localhost:<API_PORT>/docs`
 - RabbitMQ UI: `http://127.0.0.1:15672`
 - API-контейнер сам применяет `alembic upgrade head`.
 - Postgres и RabbitMQ слушают только `127.0.0.1`; наружу опубликован только API.
@@ -38,12 +38,93 @@ docker compose up --build
 | `GET` | `/api/v1/payments/{id}` | Получить платёж и состояние доставки webhook. Ответ `200` / `404`. |
 | `POST` | `/api/v1/payments/{id}/webhook/replay` | Повторно отправить webhook после `failed`. Ответ `200`, `404` для неизвестного платежа, `409` если replay недоступен, `502` при неудачной доставке. |
 
-Ручная проверка — через Swagger `/docs`.
+### Примеры curl
 
-Сценарии для проверки:
+Выполняйте из корня проекта; `API_KEY` и `API_PORT` возьмите из `.env`.
+
+```bash
+export API_KEY="$(grep -E '^API_KEY=' .env | cut -d= -f2- | tr -d '\"')"
+export API_PORT="$(grep -E '^API_PORT=' .env | cut -d= -f2- | tr -d '\"')"
+
+# 1. Создание платежа. Ключ идемпотентности сохраняем для повтора.
+IDEMPOTENCY_KEY="demo-$(date +%s)"
+PAYMENT_ID=$(curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments" \
+  -H "X-API-Key: ${API_KEY}" \
+  -H "Idempotency-Key: ${IDEMPOTENCY_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": "1500.00",
+    "currency": "RUB",
+    "description": "Оплата заказа №42",
+    "metadata": {"order_id": "42"},
+    "webhook_url": "https://httpbin.org/post"
+  }' | uv run python -c 'import json,sys; print(json.load(sys.stdin)["payment_id"])')
+
+echo "PAYMENT_ID=${PAYMENT_ID}"
+
+# 2. Идемпотентный повтор: тот же ключ и тело → тот же payment_id, 202.
+curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments" \
+  -H "X-API-Key: ${API_KEY}" \
+  -H "Idempotency-Key: ${IDEMPOTENCY_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": "1500.00",
+    "currency": "RUB",
+    "description": "Оплата заказа №42",
+    "metadata": {"order_id": "42"},
+    "webhook_url": "https://httpbin.org/post"
+  }'
+
+# 3. Статус платежа и состояние доставки webhook.
+curl -sS "http://localhost:${API_PORT}/api/v1/payments/${PAYMENT_ID}" \
+  -H "X-API-Key: ${API_KEY}"
+```
+
 - `webhook_url=https://httpbin.org/post` — успешная доставка; статус платежа меняется `pending → succeeded/failed` за 2–5 секунд, `webhook_status` становится `delivered`.
-- `webhook_url=https://example.com/webhook` — ответ не 2xx; после 3 попыток сообщение уходит в `payments.dlq`, `webhook_status=failed`; повторная отправка — через replay-эндпоинт.
 - Повтор с тем же `Idempotency-Key` и телом возвращает тот же `payment_id`; другое тело — `409`.
+
+### Сценарий DLQ и replay
+
+```bash
+export API_KEY="$(grep -E '^API_KEY=' .env | cut -d= -f2- | tr -d '\"')"
+export API_PORT="$(grep -E '^API_PORT=' .env | cut -d= -f2- | tr -d '\"')"
+
+# 1. Платёж с URL, который стабильно отвечает 500.
+DLQ_KEY="dlq-$(date +%s)"
+DLQ_PAYMENT_ID=$(curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments" \
+  -H "X-API-Key: ${API_KEY}" \
+  -H "Idempotency-Key: ${DLQ_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": "777.00",
+    "currency": "RUB",
+    "description": "DLQ replay demo",
+    "metadata": {"order_id": "777"},
+    "webhook_url": "https://httpbin.org/status/500"
+  }' | uv run python -c 'import json,sys; print(json.load(sys.stdin)["payment_id"])')
+
+# 2. Подождите 15–20 секунд: gateway 2–5 с + 3 попытки webhook.
+curl -sS "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}" \
+  -H "X-API-Key: ${API_KEY}"
+# Ожидаемо: "webhook_status": "failed", "webhook_attempts": 3
+
+# 3. Replay, пока URL отвечает 500, вернёт 502.
+curl -sS -i -X POST "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}/webhook/replay" \
+  -H "X-API-Key: ${API_KEY}"
+
+# 4. Чтобы проверить успешный replay, направьте webhook_url на рабочий URL.
+set -a; source .env; set +a
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "UPDATE payments SET webhook_url='https://httpbin.org/post' WHERE id='${DLQ_PAYMENT_ID}';"
+
+# 5. Теперь replay вернёт 200, webhook_status=delivered, attempts=4.
+curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}/webhook/replay" \
+  -H "X-API-Key: ${API_KEY}"
+
+# 6. Повторный replay для delivered вернёт 409.
+curl -sS -i -X POST "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}/webhook/replay" \
+  -H "X-API-Key: ${API_KEY}"
+```
 
 ## Ключевые решения
 
@@ -51,9 +132,10 @@ docker compose up --build
 |---|---|
 | `Idempotency-Key` + `UNIQUE` + обработка `IntegrityError` | повтор не создаёт дубль; при гонке возвращается платёж победителя |
 | Outbox + `FOR UPDATE SKIP LOCKED` + один `commit` на пачку | событие не теряется; блокировки держатся до конца пачки |
-| At-least-once + `SELECT FOR UPDATE` на платеже | дубли безопасны; два consumer'а не обрабатывают один `pending` параллельно |
+| Consumer: `SELECT FOR UPDATE` на платеже | два consumer'а не обрабатывают один `pending` параллельно; webhook при этом at-least-once |
 | Webhook: 3 попытки, backoff, `Retry-After`, затем `Nack(requeue=False)` | недоставленный webhook не откатывает платёж и уходит в DLQ |
 | `webhook_status` / `webhook_attempts` / `webhook_last_error` + replay | состояние доставки видно в API; уведомление можно доставить после DLQ |
+| Replay: HTTP вне транзакции | соединение из пула не занято на время HTTP; повторная доставка допустима (at-least-once) |
 | Quorum-очереди + DLX/DLQ | переживают потерю узла; «ядовитые» сообщения не теряются |
 | UoW для request-scoped сервисов, session factory для Outbox Relay | разные жизненные циклы и границы транзакций |
 | Outbox Relay внутри consumer | осознанный компромисс: отдельный контейнер был бы чище по связанности, но нарушил бы требование ТЗ «ровно 4 контейнера»; при необходимости relay выносится отдельно |
@@ -86,7 +168,8 @@ docker compose up --build
 | `DATABASE_URL` / `RABBITMQ_URL` | только для локального запуска |
 | `OUTBOX_POLL_INTERVAL_SECONDS` / `OUTBOX_BATCH_SIZE` | `1.0` / `100` |
 | `OUTBOX_RETENTION_DAYS` / `OUTBOX_RETENTION_INTERVAL_SECONDS` | `7` / `3600` |
-| `WEBHOOK_TIMEOUT_SECONDS` / `LOG_LEVEL` | `10.0` / `INFO` |
+| `WEBHOOK_TIMEOUT_SECONDS` | `10.0` |
+| `LOG_LEVEL` | `INFO` |
 
 Если меняете креды на существующих volume, нужен `docker compose down -v` или ручное создание пользователей. Пароли со спецсимволами (`@`, `:`, `/`) нужно URL-кодировать в `DATABASE_URL`/`RABBITMQ_URL`; для Docker проще использовать пароль без этих символов.
 
@@ -97,7 +180,7 @@ set -a; source .env; set +a
 uv sync
 docker compose up -d postgres rabbitmq
 uv run alembic upgrade head
-uv run uvicorn api.app:create_app --factory --reload --port 8000
+uv run uvicorn api.app:create_app --factory --reload --port "${API_PORT:-8000}"
 uv run faststream run worker.app:app   # другой терминал
 ```
 
@@ -107,6 +190,7 @@ uv run faststream run worker.app:app   # другой терминал
 docker compose up -d postgres
 uv run pytest
 uv run ruff check
+uv run ruff format --check src tests
 uv run mypy src tests
 ```
 
@@ -122,8 +206,13 @@ uv run mypy src tests
 
 - Шлюз эмулируется: реальные деньги не задействованы.
 - Webhook не подписан; в продакшене нужны HMAC, timestamp и replay protection.
+- `webhook_url` задаётся клиентом и может указывать на внутренние адреса (SSRF): consumer и replay выполняют POST из своей сети. В продакшене нужны валидация/allowlist, запрет private/loopback/link-local и защита от DNS rebinding; сейчас такой проверки нет.
 - Доставка at-least-once: клиент должен быть идемпотентным.
 - Аутентификация статическая: `X-API-Key`.
 - После 3 неудач webhook остаётся в DLQ; автоматического планировщика повторной отправки нет — только ручной replay.
+- Replay выполняет HTTP вне транзакции и не удерживает row lock. Два параллельных replay могут доставить webhook дважды; это допустимо, клиент должен дедуплицировать уведомления по `payment_id`. При гонке итоговый `webhook_status` — последний записавший.
+- Consumer удерживает `SELECT FOR UPDATE` на строке платежа на время эмуляции шлюза (2–5 с), чтобы два consumer'а не вызвали шлюз дважды. Это осознанный компромисс: без idempotency key провайдера вынос вызова из-под лока допускает двойное списание.
 - Падение между вызовом шлюза и commit требует idempotency key на стороне провайдера; `SELECT FOR UPDATE` закрывает только параллельных consumer'ов.
+- Если запись результата webhook в БД упадёт после успешной доставки, `webhook_status` может остаться `pending`; replay для `pending` недоступен. Ретрая записи нет — в продакшене нужен reconciliation/outbox для результата доставки.
+- Retention outbox считает возраст по `created_at` и удаляет `processed` старше `OUTBOX_RETENTION_DAYS` одним `DELETE` без батчей. Для больших объёмов нужен батчевый `DELETE`; старый backlog, опубликованный только сейчас, удаляется при ближайшей очистке — это безопасно, так как событие уже опубликовано.
 - Outbox Relay живёт внутри consumer: при падении consumer публикация событий останавливается до рестарта.
