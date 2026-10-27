@@ -41,6 +41,7 @@ docker compose up --build
 ### Примеры curl
 
 Выполняйте из корня проекта; `API_KEY` и `API_PORT` возьмите из `.env`.
+Примеры используют `httpbin.org`; если он недоступен, замените `webhook_url` на свой тестовый URL.
 
 ```bash
 export API_KEY="$(grep -E '^API_KEY=' .env | cut -d= -f2- | tr -d '\"')"
@@ -58,7 +59,7 @@ PAYMENT_ID=$(curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments" \
     "description": "Оплата заказа №42",
     "metadata": {"order_id": "42"},
     "webhook_url": "https://httpbin.org/post"
-  }' | uv run python -c 'import json,sys; print(json.load(sys.stdin)["payment_id"])')
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["payment_id"])')
 
 echo "PAYMENT_ID=${PAYMENT_ID}"
 
@@ -101,7 +102,7 @@ DLQ_PAYMENT_ID=$(curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments"
     "description": "DLQ replay demo",
     "metadata": {"order_id": "777"},
     "webhook_url": "https://httpbin.org/status/500"
-  }' | uv run python -c 'import json,sys; print(json.load(sys.stdin)["payment_id"])')
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["payment_id"])')
 
 # 2. Подождите 15–20 секунд: gateway 2–5 с + 3 попытки webhook.
 curl -sS "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}" \
@@ -112,12 +113,14 @@ curl -sS "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}" \
 curl -sS -i -X POST "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}/webhook/replay" \
   -H "X-API-Key: ${API_KEY}"
 
-# 4. Чтобы проверить успешный replay, направьте webhook_url на рабочий URL.
+# 4. Чтобы проверить успешный replay, направьте webhook_url на рабочий URL
+#    (в тестовом стеке — через SQL; в реальном сценарии URL задаётся при создании).
 set -a; source .env; set +a
 docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   -c "UPDATE payments SET webhook_url='https://httpbin.org/post' WHERE id='${DLQ_PAYMENT_ID}';"
 
-# 5. Теперь replay вернёт 200, webhook_status=delivered, attempts=4.
+# 5. Теперь replay вернёт 200, webhook_status=delivered, attempts=7
+#    (3 автоматические + 3 неудачного replay + 1 успешный).
 curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}/webhook/replay" \
   -H "X-API-Key: ${API_KEY}"
 
