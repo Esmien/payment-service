@@ -105,6 +105,7 @@ DLQ_PAYMENT_ID=$(curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments"
   }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["payment_id"])')
 
 # 2. Подождите 15–20 секунд: gateway 2–5 с + 3 попытки webhook.
+sleep 15
 curl -sS "http://localhost:${API_PORT}/api/v1/payments/${DLQ_PAYMENT_ID}" \
   -H "X-API-Key: ${API_KEY}"
 # Ожидаемо: "webhook_status": "failed", "webhook_attempts": 3
