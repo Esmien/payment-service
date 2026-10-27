@@ -76,7 +76,8 @@ curl -sS -X POST "http://localhost:${API_PORT}/api/v1/payments" \
     "webhook_url": "https://httpbin.org/post"
   }'
 
-# 3. Статус платежа и состояние доставки webhook.
+# 3. Подождите 10 секунд: gateway 2–5 с + отправка webhook.
+sleep 10
 curl -sS "http://localhost:${API_PORT}/api/v1/payments/${PAYMENT_ID}" \
   -H "X-API-Key: ${API_KEY}"
 ```
