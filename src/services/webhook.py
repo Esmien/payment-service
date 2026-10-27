@@ -2,13 +2,63 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 import httpx
 from loguru import logger
 
+from core.constants import Currency, PaymentStatus
 from core.exceptions import WebhookDeliveryError
-from core.utils import RETRY_MAX_ATTEMPTS, external_api_retry
+from core.utils import external_api_retry
+from models import Payment
 from schemas import WebhookPayload
+
+
+class WebhookSender(Protocol):
+    """Контракт отправки webhook-уведомления."""
+
+    async def send(self, *, url: str, payload: WebhookPayload) -> int:
+        """Отправляет уведомление на URL клиента.
+
+        Args:
+            url: URL клиента для получения уведомления.
+            payload: Тело уведомления.
+
+        Returns:
+            Количество выполненных HTTP-попыток.
+
+        Raises:
+            WebhookDeliveryError: Если доставить уведомление не удалось.
+        """
+        ...
+
+
+def build_webhook_payload(*, payment: Payment) -> WebhookPayload:
+    """Собирает тело webhook-уведомления из финального состояния платежа.
+
+    Args:
+        payment: Платеж с финальным статусом и заполненным ``processed_at``.
+
+    Returns:
+        Тело уведомления для отправки клиенту.
+
+    Raises:
+        RuntimeError: Если у платежа отсутствует ``processed_at`` — нарушен инвариант
+            «финальный статус сохраняется вместе с временем обработки».
+    """
+    processed_at = payment.processed_at
+    if processed_at is None:
+        # Инвариант: финальный статус всегда сохраняется вместе с processed_at.
+        raise RuntimeError(f"Payment {payment.id} has final status without processed_at")
+
+    return WebhookPayload(
+        payment_id=payment.id,
+        status=PaymentStatus(payment.status),
+        amount=payment.amount,
+        currency=Currency(payment.currency),
+        metadata=payment.metadata_,
+        processed_at=processed_at,
+    )
 
 
 class WebhookClient:
@@ -38,7 +88,7 @@ class WebhookClient:
         self._client = client
         self._sleep = sleep
 
-    async def send(self, *, url: str, payload: WebhookPayload) -> None:
+    async def send(self, *, url: str, payload: WebhookPayload) -> int:
         """Отправляет POST-запрос с результатом платежа на webhook_url.
 
         Вызов обернут в retry-политику ``external_api_retry``: до 3 попыток,
@@ -50,14 +100,20 @@ class WebhookClient:
             url: URL клиента для получения уведомления.
             payload: Тело уведомления.
 
+        Returns:
+            Количество выполненных HTTP-попыток.
+
         Raises:
             WebhookDeliveryError: Если после всех попыток доставить уведомление
                 не удалось.
         """
+        attempts = 0
 
         @external_api_retry(sleep=self._sleep)
         async def _post() -> None:
             """Выполняет один POST-запрос и проверяет, что ответ 2xx."""
+            nonlocal attempts
+            attempts += 1
             response = await self._client.post(
                 url=url,
                 json=payload.model_dump(mode="json"),
@@ -76,12 +132,14 @@ class WebhookClient:
         except httpx.HTTPError as exc:
             logger.error(
                 "Webhook delivery failed after {} attempts: url={}, error={}",
-                RETRY_MAX_ATTEMPTS,
+                attempts,
                 url,
                 repr(exc),
             )
             raise WebhookDeliveryError(
-                internal_message=f"Webhook delivery failed after {RETRY_MAX_ATTEMPTS} attempts: url={url}",
+                internal_message=f"Webhook delivery failed after {attempts} attempts: url={url}",
                 url=url,
-                attempts=RETRY_MAX_ATTEMPTS,
+                attempts=attempts,
             ) from exc
+
+        return attempts

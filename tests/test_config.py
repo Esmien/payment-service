@@ -10,6 +10,8 @@ from core.config import (
     DEFAULT_DATABASE_URL,
     DEFAULT_OUTBOX_BATCH_SIZE,
     DEFAULT_OUTBOX_POLL_INTERVAL_SECONDS,
+    DEFAULT_OUTBOX_RETENTION_DAYS,
+    DEFAULT_OUTBOX_RETENTION_INTERVAL_SECONDS,
     DEFAULT_RABBITMQ_URL,
     DEFAULT_WEBHOOK_TIMEOUT_SECONDS,
     Settings,
@@ -27,6 +29,8 @@ SETTINGS_ENV_VARS: Final[tuple[str, ...]] = (
     "API_KEY",
     "OUTBOX_POLL_INTERVAL_SECONDS",
     "OUTBOX_BATCH_SIZE",
+    "OUTBOX_RETENTION_DAYS",
+    "OUTBOX_RETENTION_INTERVAL_SECONDS",
     "WEBHOOK_TIMEOUT_SECONDS",
     "LOG_LEVEL",
 )
@@ -66,6 +70,8 @@ def test_settings_loads_values_from_environment(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv(name="API_KEY", value=TEST_API_KEY)
     monkeypatch.setenv(name="OUTBOX_POLL_INTERVAL_SECONDS", value="0.5")
     monkeypatch.setenv(name="OUTBOX_BATCH_SIZE", value="50")
+    monkeypatch.setenv(name="OUTBOX_RETENTION_DAYS", value="14")
+    monkeypatch.setenv(name="OUTBOX_RETENTION_INTERVAL_SECONDS", value="7200")
     monkeypatch.setenv(name="WEBHOOK_TIMEOUT_SECONDS", value="3")
     monkeypatch.setenv(name="LOG_LEVEL", value="DEBUG")
 
@@ -77,6 +83,8 @@ def test_settings_loads_values_from_environment(monkeypatch: pytest.MonkeyPatch)
     assert settings.api_key.get_secret_value() == TEST_API_KEY
     assert settings.outbox_poll_interval_seconds == 0.5
     assert settings.outbox_batch_size == 50
+    assert settings.outbox_retention_days == 14
+    assert settings.outbox_retention_interval_seconds == 7200.0
     assert settings.webhook_timeout_seconds == 3.0
     assert settings.log_level == "DEBUG"
 
@@ -95,6 +103,8 @@ def test_settings_uses_defaults_for_optional_values(monkeypatch: pytest.MonkeyPa
     assert str(settings.rabbitmq_url) == DEFAULT_RABBITMQ_URL
     assert settings.outbox_poll_interval_seconds == DEFAULT_OUTBOX_POLL_INTERVAL_SECONDS
     assert settings.outbox_batch_size == DEFAULT_OUTBOX_BATCH_SIZE
+    assert settings.outbox_retention_days == DEFAULT_OUTBOX_RETENTION_DAYS
+    assert settings.outbox_retention_interval_seconds == DEFAULT_OUTBOX_RETENTION_INTERVAL_SECONDS
     assert settings.webhook_timeout_seconds == DEFAULT_WEBHOOK_TIMEOUT_SECONDS
     assert settings.log_level == DEFAULT_LOG_LEVEL
 
@@ -110,6 +120,8 @@ def test_settings_requires_api_key() -> None:
     argvalues=[
         ("OUTBOX_POLL_INTERVAL_SECONDS", "0"),
         ("OUTBOX_BATCH_SIZE", "-1"),
+        ("OUTBOX_RETENTION_DAYS", "0"),
+        ("OUTBOX_RETENTION_INTERVAL_SECONDS", "0"),
         ("WEBHOOK_TIMEOUT_SECONDS", "0"),
     ],
 )

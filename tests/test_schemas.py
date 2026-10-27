@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 
-from core.constants import Currency, PaymentStatus
+from core.constants import Currency, PaymentStatus, WebhookStatus
 from schemas import (
     CreatePaymentRequest,
     PaymentCreatedResponse,
@@ -171,6 +171,9 @@ class TestPaymentDetailResponse:
             webhook_url="https://example.com/webhook",
             created_at=CREATED_AT,
             processed_at=processed_at,
+            webhook_status="delivered",
+            webhook_attempts=2,
+            webhook_last_error=None,
         )
 
     def test_maps_all_fields_from_orm_object(self) -> None:
@@ -185,6 +188,9 @@ class TestPaymentDetailResponse:
         assert response.metadata == {"order": 1}
         assert response.status is PaymentStatus.SUCCEEDED
         assert response.processed_at is None
+        assert response.webhook_status is WebhookStatus.DELIVERED
+        assert response.webhook_attempts == 2
+        assert response.webhook_last_error is None
 
     def test_processed_at_is_accepted_when_set(self) -> None:
         """Заполненное время обработки сохраняется в ответе."""

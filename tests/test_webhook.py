@@ -102,8 +102,9 @@ async def test_send_delivers_payload_on_first_attempt() -> None:
     payload = _build_payload()
 
     async with server.client() as client:
-        await WebhookClient(client=client, sleep=sleep).send(url=WEBHOOK_URL, payload=payload)
+        attempts = await WebhookClient(client=client, sleep=sleep).send(url=WEBHOOK_URL, payload=payload)
 
+    assert attempts == 1
     assert len(server.requests) == 1
     assert sleep.delays == []
 
@@ -125,8 +126,9 @@ async def test_send_retries_transient_errors_until_success() -> None:
     sleep = _SleepRecorder()
 
     async with server.client() as client:
-        await WebhookClient(client=client, sleep=sleep).send(url=WEBHOOK_URL, payload=_build_payload())
+        attempts = await WebhookClient(client=client, sleep=sleep).send(url=WEBHOOK_URL, payload=_build_payload())
 
+    assert attempts == RETRY_MAX_ATTEMPTS
     assert len(server.requests) == RETRY_MAX_ATTEMPTS
     assert len(sleep.delays) == RETRY_MAX_ATTEMPTS - 1
     for delay in sleep.delays:

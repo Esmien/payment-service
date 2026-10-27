@@ -40,6 +40,8 @@ def create_worker_app() -> FastStream:
         queue=payments_new_queue,
         poll_interval_seconds=settings.outbox_poll_interval_seconds,
         batch_size=settings.outbox_batch_size,
+        retention_days=settings.outbox_retention_days,
+        retention_interval_seconds=settings.outbox_retention_interval_seconds,
     )
     relay_task: asyncio.Task[None] | None = None
 

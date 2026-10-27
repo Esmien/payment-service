@@ -1,17 +1,27 @@
 """Тесты сервиса создания и получения платежей (TASK-3.1)."""
 
+import asyncio
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from core.constants import EVENT_TYPE_PAYMENT_CREATED, Currency, OutboxStatus, PaymentStatus
+from core.constants import (
+    EVENT_TYPE_PAYMENT_CREATED,
+    WEBHOOK_LAST_ERROR_MAX_LENGTH,
+    Currency,
+    OutboxStatus,
+    PaymentStatus,
+    WebhookStatus,
+)
 from core.exceptions import IdempotencyConflictError, PaymentNotFoundError
 from core.uow import UnitOfWork
 from models import OutboxEvent, Payment
+from repositories.payment_repo import PaymentRepository
 from schemas import CreatePaymentRequest
 from services.payment_service import PaymentService
 
@@ -50,6 +60,67 @@ def _build_service(*, session: AsyncSession) -> PaymentService:
     return PaymentService(uow=UnitOfWork(session=session))
 
 
+class _FakeScalarSession:
+    """Сессия, запоминающая SQL и не выполняющая его."""
+
+    def __init__(self) -> None:
+        """Инициализирует пустое хранилище запроса."""
+        self.statement: Select[Any] | None = None
+
+    async def scalar(self, statement: Select[Any]) -> None:
+        """Запоминает переданный запрос.
+
+        Args:
+            statement: SQL-запрос для проверки.
+        """
+        self.statement = statement
+
+
+async def test_get_by_id_for_update_uses_row_lock() -> None:
+    """Загрузка платежа для consumer использует FOR UPDATE."""
+    session = _FakeScalarSession()
+    repository = PaymentRepository(session=session)  # type: ignore[arg-type]
+
+    await repository.get_by_id_for_update(payment_id=uuid4())
+
+    assert session.statement is not None
+    compiled_sql = str(
+        session.statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    assert "FOR UPDATE" in compiled_sql
+
+
+async def test_get_by_id_for_update_blocks_second_consumer(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Вторая транзакция ждет, пока первая держит FOR UPDATE на платеже."""
+    async with session_factory() as session:
+        service = _build_service(session=session)
+        created_payment = await service.create_payment(
+            idempotency_key="lock-key",
+            request=_build_request(),
+        )
+
+    async with session_factory() as first_session, session_factory() as second_session:
+        first_uow = UnitOfWork(session=first_session)
+        second_uow = UnitOfWork(session=second_session)
+
+        locked_payment = await first_uow.payment.get_by_id_for_update(payment_id=created_payment.payment_id)
+        assert locked_payment is not None
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                second_uow.payment.get_by_id_for_update(payment_id=created_payment.payment_id),
+                timeout=0.2,
+            )
+
+        await second_session.rollback()
+        await first_session.rollback()
+
+
 async def test_create_payment_saves_payment_and_outbox_event(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -72,6 +143,9 @@ async def test_create_payment_saves_payment_and_outbox_event(
     assert saved_payment.currency == Currency.RUB
     assert saved_payment.metadata_ == {"order_id": 42}
     assert saved_payment.webhook_url == "https://example.com/webhook"
+    assert saved_payment.webhook_status == WebhookStatus.PENDING
+    assert saved_payment.webhook_attempts == 0
+    assert saved_payment.webhook_last_error is None
 
     assert len(outbox_events) == 1
     outbox_event = outbox_events[0]
@@ -245,3 +319,35 @@ async def test_get_payment_by_id_raises_not_found(
             await service.get_payment_by_id(payment_id=missing_payment_id)
 
     assert error_info.value.payment_id == missing_payment_id
+
+
+async def test_update_webhook_result_persists_state_and_truncates_error(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Результат доставки webhook сохраняется, а длинная ошибка обрезается под колонку."""
+    async with session_factory() as session:
+        service = _build_service(session=session)
+        created_payment = await service.create_payment(
+            idempotency_key=TEST_IDEMPOTENCY_KEY,
+            request=_build_request(),
+        )
+        payment = await session.get(Payment, created_payment.payment_id)
+        assert payment is not None
+
+        repository = PaymentRepository(session=session)
+        long_error = "e" * (WEBHOOK_LAST_ERROR_MAX_LENGTH + 10)
+        await repository.update_webhook_result(
+            payment=payment,
+            status=WebhookStatus.FAILED,
+            attempts=3,
+            last_error=long_error,
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        stored_payment = await session.get(Payment, created_payment.payment_id)
+        assert stored_payment is not None
+        assert stored_payment.webhook_status == WebhookStatus.FAILED.value
+        assert stored_payment.webhook_attempts == 3
+        assert stored_payment.webhook_last_error is not None
+        assert len(stored_payment.webhook_last_error) == WEBHOOK_LAST_ERROR_MAX_LENGTH

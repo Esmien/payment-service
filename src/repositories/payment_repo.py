@@ -8,7 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.constants import EVENT_TYPE_PAYMENT_CREATED, OutboxStatus, PaymentStatus
+from core.constants import (
+    EVENT_TYPE_PAYMENT_CREATED,
+    WEBHOOK_LAST_ERROR_MAX_LENGTH,
+    OutboxStatus,
+    PaymentStatus,
+    WebhookStatus,
+)
 from models import OutboxEvent, Payment
 from schemas import CreatePaymentRequest, PaymentEventPayload
 
@@ -59,6 +65,21 @@ class PaymentRepository:
         """
         return await self._session.get(Payment, ident=payment_id)
 
+    async def get_by_id_for_update(self, *, payment_id: UUID) -> Payment | None:
+        """Возвращает платеж с блокировкой строки до конца транзакции.
+
+        Блокировка сериализует consumer'ов: второй экземпляр ждет коммита первого
+        и затем видит уже финальный статус, не запуская шлюз повторно.
+
+        Args:
+            payment_id: Идентификатор платежа.
+
+        Returns:
+            ORM-модель платежа либо None, если платеж не найден.
+        """
+        statement = select(Payment).where(Payment.id == payment_id).with_for_update()
+        return await self._session.scalar(statement)
+
     async def get_by_idempotency_key(self, *, idempotency_key: str) -> Payment | None:
         """Возвращает платеж по ключу идемпотентности.
 
@@ -100,6 +121,9 @@ class PaymentRepository:
             status=PaymentStatus.PENDING.value,
             idempotency_key=idempotency_key,
             webhook_url=str(request.webhook_url),
+            webhook_status=WebhookStatus.PENDING.value,
+            webhook_attempts=0,
+            webhook_last_error=None,
         )
 
         self._session.add(payment)
@@ -138,5 +162,34 @@ class PaymentRepository:
         """
         payment.status = status.value
         payment.processed_at = processed_at
+        # flush отправляет UPDATE в БД; commit остается за Unit of Work.
+        await self._session.flush()
+
+    async def update_webhook_result(
+        self,
+        *,
+        payment: Payment,
+        status: WebhookStatus,
+        attempts: int,
+        last_error: str | None,
+    ) -> None:
+        """Записывает результат доставки webhook в текущую транзакцию.
+
+        ``attempts`` прибавляется к накопленному счетчику: при ручном replay
+        история попыток не теряется. Текст ошибки обрезается под размер колонки,
+        потому что внутреннее сообщение содержит URL и может быть длиннее лимита.
+
+        Args:
+            payment: Загруженная ORM-модель платежа.
+            status: Итоговый статус доставки webhook.
+            attempts: Количество HTTP-попыток текущей доставки.
+            last_error: Техническое описание ошибки или None при успехе.
+
+        Returns:
+            None
+        """
+        payment.webhook_status = status.value
+        payment.webhook_attempts = (payment.webhook_attempts or 0) + attempts
+        payment.webhook_last_error = last_error[:WEBHOOK_LAST_ERROR_MAX_LENGTH] if last_error is not None else None
         # flush отправляет UPDATE в БД; commit остается за Unit of Work.
         await self._session.flush()

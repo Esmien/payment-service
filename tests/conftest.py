@@ -16,12 +16,13 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from api.app import app
-from api.deps import get_uow
+from api.deps import get_uow, get_webhook_client
 from core.config import Settings, get_settings
-from core.constants import EVENT_TYPE_PAYMENT_CREATED, OutboxStatus, PaymentStatus
+from core.constants import EVENT_TYPE_PAYMENT_CREATED, OutboxStatus, PaymentStatus, WebhookStatus
 from core.engine import Base
+from core.exceptions import WebhookDeliveryError
 from models import OutboxEvent, Payment
-from schemas import CreatePaymentRequest, PaymentEventPayload
+from schemas import CreatePaymentRequest, PaymentEventPayload, WebhookPayload
 
 TEST_API_KEY: Final[str] = "test-api-key"
 BASE_URL: Final[str] = "http://testserver"
@@ -55,6 +56,17 @@ class InMemoryPaymentRepository:
             ORM-модель платежа либо None, если платеж не найден.
         """
         return next((payment for payment in self.payments.values() if payment.id == payment_id), None)
+
+    async def get_by_id_for_update(self, *, payment_id: UUID) -> Payment | None:
+        """Эмулирует SELECT ... FOR UPDATE в памяти.
+
+        Args:
+            payment_id: Идентификатор платежа.
+
+        Returns:
+            ORM-модель платежа либо None, если платеж не найден.
+        """
+        return await self.get_by_id(payment_id=payment_id)
 
     async def get_by_idempotency_key(self, *, idempotency_key: str) -> Payment | None:
         """Возвращает платеж по ключу идемпотентности.
@@ -103,6 +115,9 @@ class InMemoryPaymentRepository:
             webhook_url=str(request.webhook_url),
             created_at=datetime.now(tz=UTC),
             processed_at=None,
+            webhook_status=WebhookStatus.PENDING.value,
+            webhook_attempts=0,
+            webhook_last_error=None,
         )
         self.payments[idempotency_key] = payment
         self.outbox_events.append(
@@ -115,6 +130,26 @@ class InMemoryPaymentRepository:
             )
         )
         return payment
+
+    async def update_webhook_result(
+        self,
+        *,
+        payment: Payment,
+        status: WebhookStatus,
+        attempts: int,
+        last_error: str | None,
+    ) -> None:
+        """Записывает результат доставки webhook в ORM-модель.
+
+        Args:
+            payment: Платеж, который нужно обновить.
+            status: Статус доставки webhook.
+            attempts: Количество HTTP-попыток текущей доставки.
+            last_error: Техническое описание ошибки или None при успехе.
+        """
+        payment.webhook_status = status.value
+        payment.webhook_attempts = (payment.webhook_attempts or 0) + attempts
+        payment.webhook_last_error = last_error
 
     def simulate_concurrent_create(self, *, payment: Payment) -> None:
         """Планирует продажу платежа «конкурирующим» запросом при следующем INSERT.
@@ -147,6 +182,40 @@ class InMemoryUnitOfWork:
         self.rollback_calls += 1
 
 
+class InMemoryWebhookSender:
+    """Отправитель webhook в памяти для API-тестов.
+
+    Attributes:
+        calls: Пары URL и payload, переданные в send.
+        error: Ошибка, которую нужно поднять при следующей отправке.
+        attempts: Количество попыток, которое вернет успешная отправка.
+    """
+
+    def __init__(self) -> None:
+        """Инициализирует пустой журнал вызовов."""
+        self.calls: list[tuple[str, WebhookPayload]] = []
+        self.error: WebhookDeliveryError | None = None
+        self.attempts = 1
+
+    async def send(self, *, url: str, payload: WebhookPayload) -> int:
+        """Запоминает вызов и имитирует успех или ошибку доставки.
+
+        Args:
+            url: URL клиента.
+            payload: Тело уведомления.
+
+        Returns:
+            Количество попыток успешной доставки.
+
+        Raises:
+            WebhookDeliveryError: Если ошибка задана в атрибуте ``error``.
+        """
+        self.calls.append((url, payload))
+        if self.error is not None:
+            raise self.error
+        return self.attempts
+
+
 @pytest.fixture
 def payment_repository() -> InMemoryPaymentRepository:
     """Создает пустой репозиторий платежей в памяти.
@@ -168,6 +237,16 @@ def uow(payment_repository: InMemoryPaymentRepository) -> InMemoryUnitOfWork:
         Новый экземпляр InMemoryUnitOfWork.
     """
     return InMemoryUnitOfWork(payment=payment_repository)
+
+
+@pytest.fixture
+def webhook_sender() -> InMemoryWebhookSender:
+    """Создает пустой отправитель webhook в памяти.
+
+    Returns:
+        Новый экземпляр InMemoryWebhookSender.
+    """
+    return InMemoryWebhookSender()
 
 
 @pytest.fixture
@@ -209,18 +288,26 @@ def make_payment() -> PaymentFactory:
             webhook_url=str(request.webhook_url),
             created_at=datetime.now(tz=UTC),
             processed_at=None,
+            webhook_status=WebhookStatus.PENDING.value,
+            webhook_attempts=0,
+            webhook_last_error=None,
         )
 
     return _factory
 
 
 @pytest.fixture
-async def api_client(uow: InMemoryUnitOfWork, test_settings: Settings) -> AsyncIterator[AsyncClient]:
+async def api_client(
+    uow: InMemoryUnitOfWork,
+    test_settings: Settings,
+    webhook_sender: InMemoryWebhookSender,
+) -> AsyncIterator[AsyncClient]:
     """Выдает HTTP-клиент поверх ASGI-приложения с подмененными зависимостями.
 
     Args:
         uow: Unit of Work в памяти.
         test_settings: Настройки с тестовым API-ключом.
+        webhook_sender: Отправитель webhook в памяти.
 
     Yields:
         Асинхронный HTTP-клиент httpx.
@@ -242,8 +329,17 @@ async def api_client(uow: InMemoryUnitOfWork, test_settings: Settings) -> AsyncI
         """
         return test_settings
 
+    def _override_get_webhook_client() -> InMemoryWebhookSender:
+        """Возвращает отправитель webhook в памяти вместо реального httpx-клиента.
+
+        Returns:
+            Тестовый отправитель webhook.
+        """
+        return webhook_sender
+
     app.dependency_overrides[get_uow] = _override_get_uow
     app.dependency_overrides[get_settings] = _override_get_settings
+    app.dependency_overrides[get_webhook_client] = _override_get_webhook_client
 
     # raise_app_exceptions=False: необработанные исключения превращаются в 500-ответ, а не в трейсбек теста.
     transport = ASGITransport(app=app, raise_app_exceptions=False)
